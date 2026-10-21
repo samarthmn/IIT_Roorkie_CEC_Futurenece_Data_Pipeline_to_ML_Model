@@ -365,7 +365,50 @@ _Milestone 5._
 
 Task code cannot query Airflow's metadata database in Airflow 3, so the audit task reads each task's XCom: a missing result means that task did not succeed. After writing the row it raises `AirflowFailException` when anything failed. Without this, the always-successful audit leaf would turn a failed run green.
 
-_Experiment results follow in Milestone 4._
+### 10.2 How the experiments were run
+
+- Inputs were never edited by hand. `include/nammamart/make_experiment_fixtures.py` copies the five base files into `include/data/nammamart_experiments/<experiment>/` (gitignored) and applies exactly one change per folder.
+- Each run was triggered through the scheduler with config, for example `{"data_dir": "include/data/nammamart_experiments/exp05_bad_rows", "as_of_date": "2026-10-01"}`. ETL first, then ELT.
+- "Restore the original file" = the next run uses the default `data_dir`. Every run rebuilds its outputs from the files it is given (D11), so a happy-path run after each experiment restored every table. For Experiment 3 the increment was copied into `include/data/nammamart/` and removed afterwards.
+- `dq_results` and `pipeline_runs` keep every experiment run as history.
+
+### 10.3 Results (20 runs)
+
+| # | DAG | Expected | Observed | Where I saw it | What I would change |
+|---|---|---|---|---|---|
+| 1 Happy path | ETL | All green; 5 extracts in parallel; per-file counts | All 12 tasks green in 6.2 s. The 6 extract tasks all started at +0.00 s (0.2–0.45 s each); then validate 0.3 s, transform 0.2 s, load 0.3 s, reconcile 0.3 s, reports 0.2 s. In / passed / quarantined: orders 2,412 / 2,308 / 104; payments 2,228 / 2,199 / 29; customers 405 / 397 / 8; products 152 / 142 / 10; stores 15 / 15 / 0 | Graph + Gantt view; `validate` log summary table; `pipeline_runs` | Most time is scheduler gaps (~0.7 s between tasks), not work; fine at this size |
+| 1 Happy path | ELT | All green; checks in parallel; raw loads serial | All 10 tasks green in 3.4 s. The 6 check tasks started at +0.00 s (0.1–0.16 s); then load_raw 0.3 s, staging 0.5 s, marts 0.3 s, one at a time by design (single DuckDB writer). Raw 5,212 rows; staging FAIL 128 + 23 duplicate copies = 151 | Graph + Gantt; `load_raw` and `transform_staging` logs | Same |
+| 2 Re-run | ETL | Fact counts and revenue unchanged | Fact 2,308 rows, ₹11,34,962.80, identical; quarantine files and `etl_rejected_rows` get a new batch for the new run | `pipeline_runs`; query on `etl_fact_orders` | — |
+| 2 Re-run | ELT | Marts unchanged; raw grows | Marts identical (₹11,34,962.80); `raw_orders` grew by one 2,412-row batch. Correct: raw is an append-only ingestion log and staging reads only the current batch | `SELECT _run_id, COUNT(*) FROM raw_orders GROUP BY 1` | Partition raw by load date and set a retention period (see Part E) |
+| 3 Increment | ETL | 150 inserted, 10 updated, no duplicates | `validate` log: "160 rows, inserted 150, updated 10, rejected 0". Fact 2,458 rows, 0 duplicate `order_id`. ORD000017 and ORD000822 now RETURNED (net revenue 0, `source_file` = increment). September revenue ₹11,34,962.80 → ₹11,30,769.10 (−₹4,193.70 for the 10 returns); 1 October adds ₹79,652.20 | `validate` log; fact queries | The earlier "as reported" September figure is gone (see Part E question 9) |
+| 3 Increment | ELT | MERGE: 150 inserted, 10 updated | `transform_staging` log: "MERGE inserted 150, updated 10". Same 2,458 orders, same revenue split as ETL. Raw keeps both files of the run (2,412 + 160 rows). Reconciliation gains 10 `RETURNED_NOT_REFUNDED` (+₹4,193.70) and 150 `PAYMENT_NOT_YET_RECEIVED` (−₹79,652.20) | `transform_staging` log; `stg_orders`; `mart_payment_reconciliation` | Load the next day's payments file with the orders, so timing rows clear themselves |
+| 4 Missing file | ETL | `extract_products` retries then fails; downstream `upstream_failed`; audit row FAILED | `extract_products` tried 3 times at 13:44:10, 13:46:10, 13:48:10 UTC (2-minute `retry_delay`, `up_for_retry` in between), `FileNotFoundError: Source file not found: …/products.csv` each time, then `failed`. Every later task `upstream_failed`. `audit_run` still ran, wrote `FAILED` (5,060 rows extracted, 0 loaded) and turned the run red. Finance tables kept the last good load | Grid view (task states, try numbers); task log; `pipeline_runs` | Nothing alerted anyone: someone has to open the UI. Add a failure alert (the trainer's Slack notifier or email) and an alert on a *missing* 09:00 run |
+| 4 Missing file | ELT | Same on `check_products` | Same pattern: 3 attempts 2 minutes apart, then `failed`; `load_raw` onwards `upstream_failed`; audit `FAILED`; nothing written to raw | Same | Same |
+| 5 New bad data | ETL | Each of the 5 rows quarantined with the right reason | ORD900001 `missing_customer_id`; ORD900002 `nonpositive_quantity`; ORD900003 `unknown_store_id`; ORD900004 `invalid_order_status` (SHIPPED); ORD900005 `outside_expected_period;future_order_ts`. `dq_results` +1 on exactly the matching checks: required_fields 19→20, quantity_positive 10→11, fk_store 5→6, status_valid 3→4, in_expected_period 7→8, not_future 5→6 | `orders_failed_<run>.csv`; `dq_results` compared with the happy path | — |
+| 5 New bad data | ELT | Each row in `raw_orders`, FAIL in `stg_orders` with the reason | All 5 rows kept in `raw_orders` as received and FAIL in `stg_orders` with the same reasons as the ETL; same `dq_results` deltas | `stg_orders WHERE dq_status = 'FAIL'`; `dq_results` | — |
+| 6 Schema change | ETL | Loud failure, no retries | `extract_orders` failed on attempt 1 (no retries: `AirflowFailException`): "Schema check failed for orders.csv: missing column(s) ['order_amount']; header was [… 'total' …]". Downstream `upstream_failed`, audit `FAILED`, nothing loaded | Task log; Grid view | Loud is right. A data contract agreed with the OMS team would turn this into a planned change |
+| 6 Schema change | ELT | Loud failure before raw | `check_orders` failed the same way on attempt 1; 0 rows in `raw_orders` for that run. Had the raw load used `SELECT *` / `BY NAME`, `order_amount` would have loaded as NULL and every order would have failed the formula check instead: a confusing, silent-looking failure | Task log; raw row count for the run | Same |
+| 7 Volume (50 orders) | ETL | Volume warning | `orders_volume_vs_previous` = WARN (50 vs 2,405 in the previous run, −98%). But the run stayed green and `etl_fact_orders` was **replaced by 48 orders**: the COO's report would have shown ~2% of the real business | `dq_results`; `pipeline_runs` (`SUCCESS_WITH_WARNINGS`) | Make a >90% drop Critical: stop before load so the previous day's tables stay published, and alert |
+| 7 Volume (50 orders) | ELT | Volume warning | Same WARN; marts rebuilt from 48 orders; raw kept the 50-row batch | Same | Same: skip `transform_marts` when volume fails |
+| 8 Distribution drift (S03 price ×100) | ETL | Some check catches it | Caught only because `order_amount` no longer matched the formula: `orders_amount_formula` 18 → 175 (+157 S03 orders). All of S03 was quarantined, so S03 vanished from the report: North revenue ₹2,26,807.50 → ₹1,49,552.65; total ₹11,34,962.80 → ₹10,57,707.95 (−₹77,254.85, −6.8%); `ORDER_REJECTED` reconciliation rows 90 → 234 | `dq_results`; `etl_daily_zone_revenue`; reconciliation | If the source had also multiplied `order_amount`, nothing would catch it and S03 revenue would be ×100. Add a distribution check: `unit_price` vs catalogue `mrp`, or each store's average order value vs its history |
+| 8 Distribution drift | ELT | Same | Identical numbers in `mart_daily_store_kpis` and `stg_orders` (FAIL, `order_amount_mismatch`, raw `unit_price` 20500.0 kept for audit) | Same | Same |
+| 9 Freshness (30 days old) | ETL | Timeliness warning | `orders_freshness` = WARN; log "latest valid order 2026-09-30 23:46:37, reference 2026-10-31 09:00, lag 729.2 h (limit 24 h)". Run still green | `validate` log; `dq_results` | A WARN on stale data should alert (or block) — month-old numbers at the 09:30 review is the problem this project exists to fix |
+| 9 Freshness | ELT | Same | Same WARN, same lag | `transform_staging` log; `dq_results` | Same |
+| 10 Recovery | ETL | Only the failed task and downstream re-run | After putting `products.csv` back in the same fixture folder, **Clear** on `extract_products` with downstream (Airflow REST API `clearTaskInstances`, the call behind the UI button). The 5 other extracts kept their original state (attempt 1). `extract_products` ran as attempt 4, then validate → reports, `audit_run` attempt 2. `pipeline_runs` still has **one** row for the run, updated to `SUCCESS_WITH_WARNINGS`. Works because the failed run's intermediate files were kept | Grid view try numbers; `pipeline_runs` | — |
+| 10 Recovery | ELT | Same | Cleared `check_products`, `load_raw`, `transform_staging`, `transform_marts`, `audit_run`; the other checks untouched; run green, one audit row | Same | — |
+
+### 10.4 Five pillars of data observability
+
+| Pillar | What covers it | Observed |
+|---|---|---|
+| Freshness | `orders_freshness` (lag of the latest valid order vs 09:00 on the reference day) | Caught the 30-day-old data (729 h) — but only as a WARN in a green run |
+| Volume | `orders_volume_vs_previous` | Caught the −98% drop — but the 48-order report was still published |
+| Schema | Header check in every extract / check task, `AirflowFailException` | Strong: failed at once with the exact missing column, no retries, nothing loaded |
+| Distribution | Rule checks only: formula, delivery-minute limits, mrp/cost | Caught the ×100 price only indirectly; no statistical check would catch a consistent shift |
+| Lineage | ELT: `_source_file`, `_source_row`, `_run_id` on every raw row and carried into staging; ETL: `source_file`, `source_row`, `run_id` on the fact and in quarantine files | Every failed row traced to its file and line in both; ELT can also show the row exactly as received for any past run |
+
+**Best covered: schema** (and lineage in the ELT). A broken file fails loudly and safely every time.
+**Weakest: distribution**, then freshness/volume *alerting*: those checks detect the problem but don't stop publication or tell anyone.
 
 ## 11. Part E: Data governance
 
