@@ -16,8 +16,27 @@ python include/nammamart/profiling.py include/data/nammamart > include/reports/p
 exit
 ```
 
+Trigger a DAG (UI: **Trigger → with config**, or CLI):
+
+```bash
+astro dev run dags unpause nammamart_etl_samarth
+astro dev run dags trigger nammamart_etl_samarth --conf '{"as_of_date": "2026-10-01"}'
+```
+
+| Param | Default | Meaning |
+|---|---|---|
+| `data_dir` | `include/data/nammamart` | Input folder relative to `AIRFLOW_HOME`; must be under `include/data` (experiments point it at a generated fixture folder) |
+| `as_of_date` | none (logical date) | Freshness reference, `YYYY-MM-DD`, taken as 09:00 IST that day |
+
 - Input folder: `include/data/nammamart/` (the five base files). The 1 October increment is added in Experiment 3 by copying `assignment/nammamart_dataset/orders_2026-10-01_increment.csv` into that folder.
-- Warehouse: `include/warehouse_samarth.duckdb` (gitignored).
+- Warehouse: `include/warehouse_samarth.duckdb` (gitignored). All warehouse timestamps are IST.
+- Quarantine files: `include/quarantine/samarth/` (gitignored: they hold raw rows, including customer PII).
+- Query the warehouse while no DAG is running (DuckDB allows one writer; a read-only client still blocks writers):
+
+```bash
+astro dev bash --scheduler
+python -c "import duckdb; c=duckdb.connect('include/warehouse_samarth.duckdb', read_only=True); print(c.sql('SELECT * FROM pipeline_runs'))"
+```
 
 ## 3. Design decisions
 
@@ -130,7 +149,80 @@ Impact of D7 on September orders: 126 orders reference a product that fails its 
 
 ## 5. Part A: ETL pipeline
 
-_Milestone 2._
+DAG: `dags/nammamart_etl_samarth.py` (`nammamart_etl_samarth`). Helpers: `include/nammamart/` (`sources.py` file access, `quality.py` rules, `masking.py`, `etl.py` transforms, `warehouse.py` DuckDB, `runtime.py` run identity). Control-table DDL: `include/sql/00_create_control_tables.sql`.
+
+### 5.1 Task graph
+
+```text
+extract_orders ─────┐
+extract_payments ───┤
+extract_customers ──┤
+extract_products ───┼──► validate ─► transform ─► load_star_schema* ─► reconcile_payments* ─► build_reports* ─► audit_run*
+extract_stores ─────┤   (+quarantine)
+extract_increments ─┘                                                        * = pool duckdb_samarth
+```
+
+A straight line after the extracts: if any task fails, every later task becomes `upstream_failed`, and `audit_run` (`trigger_rule="all_done"`) still runs.
+
+| Step | What it does |
+|---|---|
+| Extract | Five parallel tasks, one per file, plus `extract_increments` (returns `[]` when no `orders_*_increment.csv` exists). Each checks the header first: a missing file raises `FileNotFoundError` (retried); a missing or renamed column raises `AirflowFailException` (fails at once, no retries). Values are read as text (`keep_default_na=False`), so `N/A` and blanks are kept as received. |
+| Validate | One task applies every rule from section 7 in pandas, file by file: stores, products, customers, then orders (the foreign-key checks need the master keys), then payments (they need the orders). Every row gets `failure_reason` (Critical) and `warning_reason` (Warning); the task log lists each failing check per file. |
+| Quarantine | Failed rows exactly as received, plus `failure_reason`, `source_row`, `run_id`, to `include/quarantine/samarth/<file>_failed_<run_id>.csv`. A file is written even when empty, so every run leaves evidence. The keys and reasons (no PII) also go to `etl_rejected_rows` for business question 6. |
+| Transform | Standardise (trim, case, payment-mode aliases), dedupe customers and products (D4), mask email and phone, join orders to the three dimensions with a left join plus an assertion that no key is missing, derive `order_date`, `net_revenue`, `gross_margin`, `within_15_min`. |
+| Load | One DuckDB transaction replaces the whole star (`CREATE OR REPLACE TABLE` ×4), so a reader never sees a half-loaded star and a re-run gives identical tables. Afterwards it asserts that `order_id` is unique in the fact. |
+| Reconcile | `etl_payment_reconciliation`: one row per order/payment mismatch with a reason (section 5.3). |
+| Report | `etl_daily_zone_revenue` and `etl_category_margin`, printed in the task log with totals. |
+| Run audit | Writes this run's `dq_results` (every check, plus the volume check) and its `pipeline_runs` row; keeps a failed run red (section 10). |
+
+Intermediate DataFrames travel between tasks as pickle files under `include/tmp/samarth/<run_id>/` (pyarrow is not installed in the image, so not Parquet); XCom carries only paths, counts and check results. The folder is deleted when a run succeeds and kept after a failure, so a Clear can resume.
+
+### 5.2 Star schema
+
+| Table | Grain | Columns |
+|---|---|---|
+| `etl_fact_orders` | one row per valid order | order_id, order_ts, order_date, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes, net_revenue, gross_margin, within_15_min, source_file, source_row, run_id, loaded_at |
+| `etl_dim_customer` | one row per customer_id | customer_id, email_masked, phone_masked, city, area, loyalty_tier, signup_date, is_active, dq_status, failure_reason, warning_reason |
+| `etl_dim_product` | one row per product_id | product_id, product_name, category, sub_category, brand, mrp, cost_price, unit, is_perishable, launch_date, dq_status, failure_reason, warning_reason |
+| `etl_dim_store` | one row per store_id | store_id, store_name, zone, area, pincode, open_date, capacity_orders_per_day, dq_status, failure_reason, warning_reason |
+| `etl_rejected_rows` | one row per quarantined row per run (history) | run_id, dag_id, run_date_ist, file_name, row_key, failure_reason, rejected_at |
+
+The fact holds only orders that passed every Critical check (acceptance criterion 2). A dimension holds one canonical row per key, **including** a master row that failed its own checks (for example P0060, blank category): that row is also written to the quarantine file, and it carries `dq_status = 'FAIL'` with its reason in the dimension. This is how decision D7 is implemented: the 126 orders on such products stay in the fact and still join to a product row, with a blank category shown as `Unknown`. Extra duplicate copies never reach a dimension.
+
+Money columns are `DECIMAL(12,2)`. No reporting table contains `email`, `phone` or `full_name`.
+
+### 5.3 Payment reconciliation
+
+All payment rows are reconciled (decision D14), including duplicates and payments for rejected or unknown orders. `difference` = SUCCESS amount paid − amount owed (owed = `order_amount` for a DELIVERED order, else 0). One reason per row:
+
+| Reason | Meaning |
+|---|---|
+| `ORDER_NOT_FOUND` | payment for an `order_id` not in any orders file |
+| `ORDER_REJECTED` | payment for an order that was quarantined, so it is not in the fact |
+| `DUPLICATE_PAYMENT_ID` | an extra copy of a payment row (would double-count if summed) |
+| `AMOUNT_MISMATCH` | DELIVERED order whose SUCCESS amount ≠ `order_amount` (±0.01) |
+| `PAYMENT_FAILED` | DELIVERED order whose payments are all FAILED |
+| `MISSING_PAYMENT` | DELIVERED order with no payment row |
+| `PAYMENT_NOT_YET_RECEIVED` | DELIVERED order with no payment, dated after the last day the payment feed covers (timing, not an error) |
+| `RETURNED_NOT_REFUNDED` | RETURNED order with a SUCCESS payment and no REFUNDED row (timing: refund pending) |
+| `CANCELLED_WITH_PAYMENT` | CANCELLED order with a SUCCESS payment |
+
+Not mismatches: CANCELLED with no payment, RETURNED with REFUNDED, RETURNED with no payment (ORD001675: no money moved), and blank `gateway_ref` on Cash on Delivery.
+
+The payment feed's last day is the latest `payment_ts` among payments for valid orders (30 Sept). An unpaid order counts as "not yet received" only if it is dated strictly **after** that day, so the unpaid 30 Sept order stays `MISSING_PAYMENT`.
+
+### 5.4 Happy-path result (`as_of_date = 2026-10-01`, September files only)
+
+| File | Rows read | Passed (incl. warnings) | Of which warnings | Quarantined |
+|---|---:|---:|---:|---:|
+| orders.csv | 2,412 | 2,308 | 10 | 104 |
+| payments.csv | 2,228 | 2,199 | 20 | 29 |
+| customers.csv | 405 | 397 | 30 | 8 |
+| products.csv | 152 | 142 | 0 | 10 |
+| stores.csv | 15 | 15 | 1 | 0 |
+| **Total** | **5,212** | | | **151** |
+
+`etl_fact_orders`: 2,308 orders (2,086 DELIVERED, 154 CANCELLED, 68 RETURNED). September net revenue **₹11,34,962.80**, gross margin **₹2,60,826.90**. `etl_payment_reconciliation`: 184 rows (AMOUNT_MISMATCH 13, DUPLICATE_PAYMENT_ID 4, MISSING_PAYMENT 27, ORDER_NOT_FOUND 8, ORDER_REJECTED 90, PAYMENT_FAILED 42).
 
 ## 6. Part B: ELT pipeline
 
@@ -138,11 +230,64 @@ _Milestone 3._
 
 ## 7. Part D: Data quality dimensions
 
-_Milestone 2–3._
+Every check below runs in both pipelines with the same `check_name` (pandas in `include/nammamart/quality.py`, SQL in the ELT staging files). **Critical** rows are quarantined (ETL) or get `dq_status = 'FAIL'` (ELT); **Warning** rows load and are counted. A row can fail several rules: all reason codes are kept, separated by `;`. Standardisation runs before validation (`UPPER(TRIM(status))`, payment-mode alias map, title-case loyalty tier).
+
+| check_name | Dimension | Severity | Rule (reason code) |
+|---|---|---|---|
+| `orders_required_fields` | Completeness | Critical | order_id, customer_id, store_id, product_id, order_ts non-blank (`missing_<col>`) |
+| `orders_delivered_has_minutes` | Completeness | Critical | DELIVERED ⇒ delivery_minutes present (`delivered_missing_delivery_minutes`) |
+| `products_category_present` | Completeness | Critical | category non-blank (`missing_category`) |
+| `stores_zone_present` | Completeness | Warning | zone non-blank, else `Unknown` (`missing_zone`) |
+| `orders_volume_vs_previous` | Completeness (volume) | Warning | orders this run < 10% of the previous run's `orders_required_fields.rows_checked` (dataset-level: rows_checked = 1) |
+| `orders_order_id_unique` | Uniqueness | Critical | extra copies quarantined, first kept (`duplicate_order_id`) |
+| `payments_payment_id_unique` | Uniqueness | Critical | `duplicate_payment_id` |
+| `customers_customer_id_unique` | Uniqueness | Critical | keep the copy with valid email and phone, else the first (`duplicate_customer_id`) |
+| `products_product_id_unique` / `stores_store_id_unique` | Uniqueness | Critical | `duplicate_product_id` / `duplicate_store_id` |
+| `orders_status_valid` | Validity | Critical | status ∈ DELIVERED, CANCELLED, RETURNED after standardising (`invalid_order_status`) |
+| `orders_status_standardised` | Validity | Warning | raw value differed from the standard one (`order_status_standardised`) |
+| `orders_payment_mode_valid` / `payments_payment_mode_valid` | Validity | Critical | mode ∈ allowed list after aliasing (`invalid_payment_mode`) |
+| `orders_payment_mode_standardised` / `payments_payment_mode_standardised` | Validity | Warning | `payment_mode_standardised` |
+| `orders_ts_parses` / `payments_ts_parses` | Validity | Critical | strict `YYYY-MM-DD HH:MM:SS` (`invalid_order_ts`, `invalid_payment_ts`) |
+| `orders_in_expected_period` | Validity | Critical | orders.csv in 1–30 Sept; increment rows not after the file date (`outside_expected_period`) |
+| `orders_discount_range` | Validity | Critical | 0 ≤ discount_pct ≤ 100 (`invalid_discount_pct`) |
+| `customers_email_format` | Validity | Warning | `^[^@\s]+@[^@\s]+\.[^@\s]+$` (`invalid_email`; masked value becomes NULL) |
+| `customers_phone_10_digits` | Validity | Warning | `^\d{10}$` (`invalid_phone`) |
+| `customers_pincode_6_digits` / `stores_pincode_6_digits` | Validity | Warning | `^\d{6}$` (`invalid_pincode`) |
+| `orders_quantity_positive` | Accuracy | Critical | integer and > 0 (`invalid_quantity`, `nonpositive_quantity`) |
+| `orders_amount_formula` | Accuracy | Critical | \|round(quantity × unit_price × (1 − discount_pct/100), 2) − order_amount\| ≤ 0.01 (`order_amount_mismatch`) |
+| `orders_delivery_max` | Accuracy | Critical | delivery_minutes integer and ≤ 120 (`invalid_delivery_minutes`, `delivery_minutes_over_120`) |
+| `orders_delivery_normal_range` | Accuracy | Warning | outside 8–35 but ≤ 120 (`delivery_minutes_outside_8_35`) |
+| `payments_amount_positive` | Accuracy | Critical | SUCCESS ⇒ amount_paid > 0 (`nonpositive_amount_paid`) |
+| `products_mrp_positive` / `products_cost_le_mrp` | Accuracy | Critical | mrp > 0 (`nonpositive_mrp`); cost_price ≤ mrp (`cost_above_mrp`) |
+| `orders_fk_customer` / `orders_fk_product` / `orders_fk_store` | Consistency | Critical | key exists in the source master file (`unknown_customer_id`, …); a master row failing its own checks does not fail the order (D7) |
+| `payments_fk_order` | Consistency | Critical | order_id exists in an orders file (`unknown_order_id`) |
+| `payments_amount_matches_order` | Consistency | Warning | SUCCESS amount = order_amount ± 0.01 (`amount_differs_from_order`); also a reconciliation row |
+| `customers_loyalty_tier_casing` | Consistency | Warning | raw tier ≠ title-cased tier (`loyalty_tier_standardised`) |
+| `orders_not_future` / `payments_not_future` / `customers_signup_not_future` | Timeliness | Critical | not later than the run's start time in IST (`future_order_ts`, …) |
+| `orders_freshness` | Timeliness | Warning | latest valid order_ts within 24 h of the reference time (D10; dataset-level: rows_checked = 1) |
+| header check (extract task) | Schema | fails the task | every expected column present; missing/renamed → `AirflowFailException`, extra → logged warning |
+
+`dq_results` gets one row per check per run, including checks with zero failures (41 rows per ETL run). `status = 'FAIL'` means "rows were quarantined", not "the DAG failed"; `WARN` means a Warning check found rows.
 
 ## 8. Part C: Scheduling
 
-_Milestone 2 (configuration) and 5 (answers verified in the UI)._
+Both DAGs use:
+
+```python
+schedule="0 9 * * 1-6"                                   # 09:00, Monday to Saturday
+start_date=pendulum.datetime(2026, 10, 1, tz=IST)        # IST = pendulum.timezone("Asia/Kolkata")
+catchup=False
+max_active_runs=1
+dagrun_timeout=timedelta(minutes=25)
+default_args={"retries": 2, "retry_delay": timedelta(minutes=2), "execution_timeout": timedelta(minutes=20)}
+```
+
+- **Timezone:** the cron is evaluated in the `start_date` timezone, so `0 9` means 09:00 IST.
+- **`catchup=False`:** every run reprocesses the full current files (D11), so backfilling the missed weekday slots since 1 October would redo identical work, compete for the single DuckDB writer, and add nothing.
+- **Retries:** 2 retries, 2 minutes apart, cover transient problems such as a file still being copied or a locked warehouse, and still finish well before the 09:30 stand-up. A schema change raises `AirflowFailException`, which skips retries, because retrying cannot fix it.
+- **`execution_timeout` / `dagrun_timeout`:** a hung task or run fails visibly instead of silently blocking the morning report. Airflow 3 has no task SLA, so the 25-minute run timeout is the guard that the report is either ready or visibly failed by about 09:25.
+
+_Answers to the four Part C questions, verified in the UI, follow in Milestone 5._
 
 ## 9. Business questions
 
@@ -150,7 +295,24 @@ _Milestone 5._
 
 ## 10. Part F: Observability tests
 
-_Milestone 4._
+### 10.1 Run audit (`pipeline_runs`)
+
+`audit_run` is the last task of each DAG, with `trigger_rule="all_done"`, so it runs even after a failure. It records what happened in two tables, both with delete-then-insert on `(dag_id, run_id)` so a Clear or retry replaces the rows instead of duplicating them:
+
+- `dq_results`: every check from the validate step plus the volume check. Writing it here means the scorecard is saved even when transform or load fails.
+- `pipeline_runs`: one row per run, defined below.
+
+| Column | ETL | ELT |
+|---|---|---|
+| `start_time` / `end_time` | DAG run start / audit time, IST | same |
+| `rows_extracted` | rows read from all source files this run | same |
+| `rows_loaded` | rows in `etl_fact_orders` | rows inserted into `raw_*` this run |
+| `rows_quarantined` | rows written to quarantine files | rows with `dq_status = 'FAIL'` + extra duplicate copies |
+| `status` | `FAILED` if any task produced no result; else `SUCCESS_WITH_WARNINGS` if any check is WARN/FAIL; else `SUCCESS` | same |
+
+Task code cannot query Airflow's metadata database in Airflow 3, so the audit task reads each task's XCom: a missing result means that task did not succeed. After writing the row it raises `AirflowFailException` when anything failed. Without this, the always-successful audit leaf would turn a failed run green.
+
+_Experiment results follow in Milestone 4._
 
 ## 11. Part E: Data governance
 
