@@ -13,3 +13,13 @@ airflow.db
 .astro/*.local.yml
 .astro/*.local.yaml
 test_api.py 
+
+# Local generated outputs
+include/warehouse_*.duckdb
+include/warehouse_*.duckdb.wal
+include/quarantine/samarth/*
+include/reports/*.csv
+include/reports/*.json
+!*.example
+*.py[cod]
+/tmp/
