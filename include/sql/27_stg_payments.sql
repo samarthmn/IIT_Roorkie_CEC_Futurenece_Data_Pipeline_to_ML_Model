@@ -3,6 +3,8 @@
 -- unknown_order_id: the order_id is in none of this run's orders files.
 -- amount_differs_from_order (Warning): a SUCCESS amount differs from the merged order's order_amount;
 -- every such case also appears in mart_payment_reconciliation.
+-- gateway_ref (a payment reference the gateway can link to a person) is not needed downstream,
+-- so it stays in raw_payments only (data minimisation).
 
 INSERT INTO stg_rejected_duplicates
 SELECT _source_file, payment_id, _source_row, 'duplicate_payment_id', _run_id
@@ -57,7 +59,6 @@ SELECT
     mode_std                                        AS payment_mode,
     CAST(paid AS DECIMAL(12,2))                     AS amount_paid,
     status_std                                      AS payment_status,
-    NULLIF(TRIM(gateway_ref), '')                   AS gateway_ref,
     CASE WHEN fr IS NOT NULL THEN 'FAIL' WHEN wr IS NOT NULL THEN 'WARN' ELSE 'PASS' END AS dq_status,
     fr                                              AS failure_reason,
     wr                                              AS warning_reason,

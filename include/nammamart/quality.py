@@ -138,7 +138,8 @@ def validate_products(raw: pd.DataFrame):
     c.record("products_product_id_unique", "Uniqueness", CRITICAL, len(extras), len(raw))
     c.add("products_category_present", "Completeness", CRITICAL, {"missing_category": is_blank(canon["category"])})
     c.add("products_mrp_positive", "Accuracy", CRITICAL, {"nonpositive_mrp": mrp.isna() | (mrp <= 0)})
-    c.add("products_cost_le_mrp", "Accuracy", CRITICAL, {"cost_above_mrp": cost.isna() | (cost > mrp)})
+    c.add("products_cost_positive", "Accuracy", CRITICAL, {"nonpositive_cost_price": cost.isna() | (cost <= 0)})
+    c.add("products_cost_le_mrp", "Accuracy", CRITICAL, {"cost_above_mrp": cost > mrp})
     return _finish(canon, extras, c)
 
 
@@ -218,15 +219,18 @@ def validate_orders(base, increments, master_keys: dict, run: dict):
           {"invalid_discount_pct": disc.isna() | (disc < 0) | (disc > 100)})
     c.add("orders_quantity_positive", "Accuracy", CRITICAL,
           {"invalid_quantity": ~is_int(q), "nonpositive_quantity": q <= 0})
+    c.add("orders_unit_price_positive", "Accuracy", CRITICAL,
+          {"nonpositive_unit_price": price.isna() | (price <= 0)})
     c.add("orders_amount_formula", "Accuracy", CRITICAL,
           {"order_amount_mismatch": amount.isna() | expected.isna() | ((expected - amount).abs() > TOLERANCE)})
     c.add("orders_delivery_max", "Accuracy", CRITICAL,
           {"invalid_delivery_minutes": ~minutes_blank & ~is_int(minutes),
+           "negative_delivery_minutes": minutes < 0,
            "delivery_minutes_over_120": minutes > config.DELIVERY_MAX_MINUTES})
     lo, hi = config.DELIVERY_NORMAL_RANGE
     c.add("orders_delivery_normal_range", "Accuracy", WARNING,
           {"delivery_minutes_outside_8_35":
-               (minutes <= config.DELIVERY_MAX_MINUTES) & ((minutes < lo) | (minutes > hi))})
+               (minutes >= 0) & (minutes <= config.DELIVERY_MAX_MINUTES) & ((minutes < lo) | (minutes > hi))})
     for col, master in [("customer_id", "customers"), ("product_id", "products"), ("store_id", "stores")]:
         key = o[col].str.strip()
         c.add(f"orders_fk_{col.removesuffix('_id')}", "Consistency", CRITICAL,
@@ -271,6 +275,13 @@ def validate_payments(raw: pd.DataFrame, source_order_ids: set, orders_checked: 
                status.eq("SUCCESS") & order_amount.notna() & ((paid - order_amount).abs() > TOLERANCE)})
     c.add("payments_not_future", "Timeliness", CRITICAL, {"future_payment_ts": ts > pd.Timestamp(run["run_ts"])})
     return _finish(canon, extras, c)
+
+
+def source_files_check(files_checked: int, files_failed: int) -> dict:
+    """Recorded on every run by audit_run, even when the run fails before validation:
+    did every source file arrive with its expected columns? rows_* count files, not rows."""
+    return {"check_name": "source_files_schema", "dimension": "Validity", "severity": CRITICAL,
+            "rows_checked": files_checked, "rows_failed": files_failed, "status": "FAIL" if files_failed else "PASS"}
 
 
 def volume_check(current_rows: int, previous_rows) -> dict:

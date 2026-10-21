@@ -22,11 +22,17 @@ def raw_table(file_name: str) -> str:
     return RAW_TABLES.get(file_name, "raw_orders")          # increment files go to raw_orders
 
 
-def load_raw_file(con, path: str, file_name: str, run: dict) -> int:
+def load_raw_file(con, path: str, file_name: str, run: dict) -> tuple[int, bool]:
     """Copy one CSV into its raw table exactly as received (all VARCHAR), in one transaction.
-    A retry or Clear of the same run first removes that run's own batch for this file."""
+    Raw is never deleted: if this run already loaded this file (a retry or Clear of the same run),
+    the existing batch is kept and nothing is inserted. The load is one transaction, so a batch
+    is either complete or absent. Returns (rows in the batch, whether it was inserted now)."""
     expected = config.EXPECTED_COLUMNS.get(file_name, config.ORDER_COLUMNS)
     table = raw_table(file_name)
+    existing = con.execute(f"SELECT COUNT(*) FROM {table} WHERE _run_id = ? AND _source_file = ?",
+                           [run["run_id"], file_name]).fetchone()[0]
+    if existing:
+        return existing, False
     columns = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in expected) + "}"
     names = ", ".join(expected)
 
@@ -40,7 +46,6 @@ def load_raw_file(con, path: str, file_name: str, run: dict) -> int:
                                        nullstr = '{NEVER_NULL}', quote = '"', escape = '"', strict_mode = true)""",
             [path],
         )
-        con.execute(f"DELETE FROM {table} WHERE _run_id = ? AND _source_file = ?", [run["run_id"], file_name])
         con.execute(
             f"""INSERT INTO {table}
                 SELECT {names},
@@ -61,7 +66,7 @@ def load_raw_file(con, path: str, file_name: str, run: dict) -> int:
         raise
     finally:
         con.execute("DROP TABLE IF EXISTS raw_batch")
-    return loaded
+    return loaded, True
 
 
 def merge_counts(con, file_name: str) -> dict:

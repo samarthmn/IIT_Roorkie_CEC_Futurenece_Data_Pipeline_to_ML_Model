@@ -7,6 +7,8 @@ Usage (inside the Airflow container):
   python /usr/local/airflow/include/nammamart/profiling.py [data_dir] [extra_file ...]
 
 Reads every value as text (keep_default_na=False) so blanks and literal 'N/A' stay visible.
+Personal data (names, emails, phones, store manager names) is never printed: only counts and the
+affected keys, so the report can be shared and committed.
 """
 
 import re
@@ -21,6 +23,7 @@ from include.nammamart import config  # noqa: E402
 CATEGORICAL = {"order_status", "payment_status", "payment_mode", "loyalty_tier", "zone", "category",
                "sub_category", "channel", "is_active", "is_perishable", "unit", "city"}
 MAX_LIST = 25
+PII_COLUMNS = {"full_name", "email", "phone", "manager_name"}
 
 
 def read_raw(path) -> pd.DataFrame:
@@ -63,7 +66,10 @@ def profile_file(name: str, df: pd.DataFrame, key: str) -> None:
     print("\n| column | profile |\n|---|---|")
     for col in df.columns:
         s = df[col]
-        if col in CATEGORICAL:
+        if col in PII_COLUMNS:
+            print(f"| {col} | personal data, values not shown: distinct={s.nunique()} "
+                  f"blank={int(s.str.strip().eq('').sum())} |")
+        elif col in CATEGORICAL:
             vc = s.value_counts(dropna=False)
             print(f"| {col} | {', '.join(f'`{v!r}`:{n}' for v, n in vc.items())} |")
         elif col.endswith("_ts"):
@@ -215,8 +221,14 @@ def main() -> None:
 
     print("\n### customers\n")
     em = c["email"].str.strip().str.lower()
-    print(f"- invalid email: {show(c.loc[~em.str.match(config.EMAIL_REGEX), 'email'].map(repr))}")
-    print(f"- phone not 10 digits: {show(c.loc[~c['phone'].str.strip().str.match(config.PHONE_REGEX), 'phone'].map(repr))}")
+    bad_email = c[~em.str.match(config.EMAIL_REGEX)]
+    kind = bad_email["email"].map(lambda e: "N/A" if e.strip().upper() == "N/A" else
+                                  "missing @" if "@" not in e else "no dot in domain")
+    print(f"- invalid email (values not shown): {kind.value_counts().to_dict()} — customers {show(bad_email['customer_id'])}")
+    bad_phone = c[~c["phone"].str.strip().str.match(config.PHONE_REGEX)]
+    lengths = bad_phone["phone"].str.replace(r"\D", "", regex=True).str.len()
+    print(f"- phone not 10 digits (values not shown): digit counts {lengths.value_counts().to_dict()} — "
+          f"customers {show(bad_phone['customer_id'])}")
     print(f"- pincode not 6 digits: {show(c.loc[~c['pincode'].str.strip().str.match(config.PINCODE_REGEX), 'pincode'].map(repr))}")
     tier = c["loyalty_tier"]
     print(f"- loyalty_tier needing case fix: {tier[tier != tier.str.strip().str.title()].value_counts().to_dict()}")

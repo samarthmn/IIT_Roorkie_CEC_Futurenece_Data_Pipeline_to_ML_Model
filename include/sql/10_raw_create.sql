@@ -1,8 +1,8 @@
 -- RAW layer: an exact copy of every source file, every run.
 -- All business columns are VARCHAR (blanks stay '', 'N/A' and 'UPI ' stay as written).
 -- Lineage: _source_row (1-based data line in the file), _loaded_at, _source_file, _run_id.
--- Append-only: each run adds one batch per file; rows are never cleaned or deleted
--- (a retry of the same run replaces only that run's own batch).
+-- Append-only: each run adds one batch per file; rows are never cleaned, updated or deleted.
+-- A retry or Clear of the same run keeps the batch that is already there instead of loading it again.
 -- Increment files land in raw_orders, told apart by _source_file.
 
 CREATE TABLE IF NOT EXISTS raw_orders (

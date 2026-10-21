@@ -69,7 +69,9 @@ def build_dim_customer(customers: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_fact(orders: pd.DataFrame, dim_product: pd.DataFrame, run: dict) -> pd.DataFrame:
-    """orders = merged canonical orders with no Critical failure. Decisions D1–D3."""
+    """orders = merged canonical orders with no Critical failure. Decisions D1–D3.
+    gross_margin is NULL for a DELIVERED order whose product failed a cost check
+    (config.UNTRUSTED_COST_REASONS): the revenue is real, the cost is not."""
     f = pd.DataFrame({
         "order_id": orders["order_id"].str.strip(),
         "order_ts": to_ts(orders["order_ts"]),
@@ -91,13 +93,19 @@ def build_fact(orders: pd.DataFrame, dim_product: pd.DataFrame, run: dict) -> pd
     f.insert(2, "order_date", f["order_ts"].dt.date)       # IST calendar date (decision D8)
 
     # Left join + assertion: an inner join would silently drop orders.
-    cost = f["product_id"].map(dim_product.set_index("product_id")["cost_price"])
-    if cost.isna().any():
-        raise ValueError(f"Orders without a product cost: {f.loc[cost.isna(), 'order_id'].tolist()[:10]}")
+    products = dim_product.set_index("product_id")
+    if not f["product_id"].isin(products.index).all():
+        raise ValueError(f"Orders without a product row: {f.loc[~f['product_id'].isin(products.index), 'order_id'].tolist()[:10]}")
+    cost = f["product_id"].map(products["cost_price"])
+    reasons = f["product_id"].map(products["failure_reason"]).fillna("")
+    cost_trusted = ~reasons.str.contains("|".join(config.UNTRUSTED_COST_REASONS)) & cost.notna()
 
     delivered = f["order_status"].eq("DELIVERED")
+    f["product_dq_status"] = f["product_id"].map(products["dq_status"])
     f["net_revenue"] = np.where(delivered, f["order_amount"], 0.0).round(2)
-    f["gross_margin"] = np.where(delivered, f["order_amount"] - f["quantity"] * cost, 0.0).round(2)
+    margin = (f["order_amount"] - f["quantity"] * cost).round(2)
+    f["gross_margin"] = pd.Series(np.where(delivered, margin, 0.0), index=f.index).astype("Float64")
+    f.loc[delivered & ~cost_trusted, "gross_margin"] = pd.NA
     f["within_15_min"] = delivered & f["delivery_minutes"].le(config.SLA_MINUTES).fillna(False).astype(bool)
     return f
 

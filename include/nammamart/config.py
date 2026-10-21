@@ -80,6 +80,10 @@ SLA_MINUTES = 15
 VOLUME_DROP_WARN_PCT = 90
 FRESHNESS_MAX_LAG_HOURS = 24
 
+# A product that failed one of these checks has an untrustworthy cost: its orders still count as
+# revenue (decision D7), but gross_margin is left NULL instead of being computed from that cost.
+UNTRUSTED_COST_REASONS = ("nonpositive_mrp", "nonpositive_cost_price", "cost_above_mrp")
+
 # Base orders must fall inside September 2026 (decision D9).
 # Increment rows must be on or before the end of the date in the file name.
 EXPECTED_PERIOD = {"orders.csv": ("2026-09-01 00:00:00", "2026-09-30 23:59:59")}

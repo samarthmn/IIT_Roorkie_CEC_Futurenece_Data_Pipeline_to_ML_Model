@@ -10,9 +10,9 @@ Two Airflow 3 pipelines replace NammaMart's manual morning report. Both are sche
 Headline results on the September files:
 
 - **Data problems in every file.** 5,212 rows were read and 151 set aside with a reason (orders 104, payments 29, products 10, customers 8). 42 issue types are logged in Part 0.
-- **The two pipelines agree to the paisa:** 2,308 valid orders, net revenue **₹11,34,962.80**, gross margin **₹2,60,826.90**, and 184 payment mismatches worth **₹1,33,277.55** that don't reconcile. They were compared row by row, not just by totals.
+- **The two pipelines agree to the paisa:** 2,308 valid orders, net revenue **₹11,34,962.80**, gross margin **₹2,66,627.75** (on orders whose product cost passed its checks; **₹25,075.45** of revenue on 5 products with a failed cost is reported with no margin), and 184 payment mismatches worth **₹1,33,277.55** that don't reconcile. They were compared row by row, not just by totals.
 - **The 1 October increment** inserted 150 orders and updated 10 returns, with no duplicates, in both pipelines.
-- **Every run is recorded:** 41 quality checks covering all six dimensions go to `dq_results`, and one row per run (including failures) goes to `pipeline_runs`.
+- **Every run is recorded:** 44 quality checks covering all six dimensions go to `dq_results` (a run that fails before validation still records its source-file check), and one row per run (including failures) goes to `pipeline_runs`.
 - **Personal data:** email and phone are masked in every reporting table.
 - **All 10 observability experiments** were run on both pipelines (section 10).
 
@@ -29,6 +29,8 @@ astro dev bash --scheduler
 python include/nammamart/profiling.py include/data/nammamart > include/reports/profile_report.md
 exit
 ```
+
+The committed `include/reports/profile_report.md` was produced this way, with the 1 October increment passed as an extra file argument. The profiler never prints names, emails or phone numbers: only counts and the affected keys.
 
 Trigger a DAG (UI: **Trigger → with config**, or CLI):
 
@@ -62,23 +64,23 @@ These decisions apply identically in the ETL (pandas) and ELT (SQL) pipelines so
 |---|---|---|
 | D1 | Fact grain | One row per `order_id`; every order has exactly one product line. |
 | D2 | Revenue | `net_revenue = order_amount` when the current status is `DELIVERED` (`order_amount` already includes the discount), else 0. Only rows that passed every Critical check count. |
-| D3 | Gross margin | `net_revenue − quantity × cost_price` for DELIVERED rows, else 0. |
+| D3 | Gross margin | `net_revenue − quantity × cost_price` for DELIVERED rows, else 0. If the product failed a cost check (`nonpositive_mrp`, `nonpositive_cost_price`, `cost_above_mrp`), the cost can't be trusted: the order's revenue still counts, but its `gross_margin` is NULL and the category report shows that revenue separately (`revenue_cost_untrusted`). |
 | D4 | Duplicate keys | Keep one canonical row (first occurrence in file order) and quarantine only the extra copies as `duplicate_<key>`. For customers, prefer the copy whose email and phone are valid, then the first occurrence. Profiling confirms the first product copy is the right one: orders for P0030 and P0140 are priced at the first copy's `mrp`. |
 | D5 | Fixable values | Trim, case-fold and documented aliases are standardisation, not rejection: `delivered` → `DELIVERED`; `upi`, `UPI ` → `UPI`; `CARD` → `Card`; `cod` → `Cash on Delivery`; `BRONZE`/`bronze`/`SILVER` → `Bronze`/`Silver`. Each mapping is logged as a Warning check. |
 | D6 | Ambiguous values | `Pending??` (status) and `Cashh` (payment mode) are not guessed. They are quarantined as Critical validity failures and raised as client questions. |
-| D7 | Dirty master rows | An order is consistent if its `customer_id`, `product_id` and `store_id` exist in the source master file. A master row that fails its own checks is written to quarantine and flagged `dq_status = 'FAIL'` in its dimension, but it stays there so its orders still join and load (category, cost, zone and tier come from that row). A blank category is shown as `Unknown`. S07's blank zone is a Warning: the store is kept with zone `Unknown`. |
+| D7 | Dirty master rows | An order is consistent if its `customer_id`, `product_id` and `store_id` exist in the source master file. A master row that fails its own checks is written to quarantine and flagged `dq_status = 'FAIL'` in its dimension, but it stays there so its orders still join and load: the *order* passed every order check, so its revenue is real. What is not used is the failed attribute itself. A blank category is shown as `Unknown`; a failed cost gives no margin (D3); every fact row carries `product_dq_status` so finance can see which orders sit on a flagged product (116 in September, ₹64,787.10 of revenue, of which ₹25,075.45 is on a failed cost). S07's blank zone is a Warning: the store is kept with zone `Unknown`. |
 | D8 | Timestamps | Strict format `YYYY-MM-DD HH:MM:SS` in both pandas and DuckDB; dates `YYYY-MM-DD`. Source timestamps are naive and treated as IST. `order_date` is the IST calendar date. |
 | D9 | Future / out-of-period | Two checks. `future_*` (Timeliness, Critical): later than the run's wall-clock time in IST. `outside_expected_period` (Validity, Critical): `orders.csv` rows outside 1–30 Sept 2026, or increment rows after the date in the file name. The second check keeps results identical whatever day the DAG runs. |
 | D10 | Freshness reference | Stale (Warning) = latest valid `order_ts` more than 24 h before the reference time. Reference = DAG param `as_of_date` when given, else the run's logical date in IST. |
-| D11 | What a run processes | The files currently in `data_dir`: the five base files plus every `orders_*_increment.csv`, applied in file-date order. ETL rebuilds its outputs from these inputs. ELT appends a raw batch under the run's `_run_id` and builds staging only from that batch. |
+| D11 | What a run processes | The files currently in `data_dir`: the five base files plus every `orders_*_increment.csv`, applied in file-date order. ETL rebuilds its outputs from these inputs. ELT appends a raw batch under the run's `_run_id` and builds staging only from that batch. Consequence: the landing folder is the system of record, so increment files must **stay** in it. If an increment file is removed, the next run no longer contains its orders or corrections (that is exactly how Experiment 3 was "restored"). This makes every run, retry and experiment reproducible from its inputs; the production alternative is a persistent, watermark-driven load (see Known limitations). |
 | D12 | Money | Compare with ±0.01 tolerance; store rounded to 2 decimals. |
-| D13 | Personal data | Reporting tables carry `email_masked`, `phone_masked` and `loyalty_tier`; no raw email or phone and no `full_name`. Only `raw_customers`, the source files and the quarantine files hold clear values. |
+| D13 | Personal data | Reporting tables carry `email_masked`, `phone_masked` and `loyalty_tier`; no raw email or phone and no `full_name`. Clear values exist only in: the source files (`include/data/`), `raw_customers`, the customers quarantine file, and the ETL's intermediate files under `include/tmp/samarth/<run>/` while a run is in progress (deleted when the run succeeds, kept after a failure so a Clear can resume). All of these are gitignored or source data. |
 | D14 | Reconciliation input | Reconcile against all payment rows (deduplicated by `payment_id`), including payments whose order was rejected or does not exist. |
 | D15 | Returns | Revenue is current-restated: a September order later RETURNED drops out of September revenue. No history table is built (see Part E, question 9). |
 
 ## 4. Part 0: Discovery and data profiling
 
-Profiler: `include/nammamart/profiling.py`. It reads every value as text (`dtype=str, keep_default_na=False`) so blanks and literal `N/A` are not silently turned into NaN, then checks headers, blanks, padding, duplicate keys, ranges, category values, referential integrity (anti-joins) and every business rule.
+Profiler: `include/nammamart/profiling.py`. It reads every value as text (`dtype=str, keep_default_na=False`) so blanks and literal `N/A` are not silently turned into NaN, then checks headers, blanks, padding, duplicate keys, ranges, category values, referential integrity (anti-joins) and every business rule. Full output: `include/reports/profile_report.md` (personal-data values are not printed, only counts and keys).
 
 ### 4.1 Profile summary
 
@@ -185,11 +187,11 @@ A straight line after the extracts: if any task fails, every later task becomes 
 | Extract | Five parallel tasks, one per file, plus `extract_increments` (returns `[]` when no `orders_*_increment.csv` exists). Each checks the header first: a missing file raises `FileNotFoundError` (retried); a missing or renamed column raises `AirflowFailException` (fails at once, no retries). Values are read as text (`keep_default_na=False`), so `N/A` and blanks are kept as received. |
 | Validate | One task applies every rule from section 7 in pandas, file by file: stores, products, customers, then orders (the foreign-key checks need the master keys), then payments (they need the orders). Every row gets `failure_reason` (Critical) and `warning_reason` (Warning); the task log lists each failing check per file. |
 | Quarantine | Failed rows exactly as received, plus `failure_reason`, `source_row`, `run_id`, to `include/quarantine/samarth/<file>_failed_<run_id>.csv`. A file is written even when empty, so every run leaves evidence. The keys and reasons (no PII) also go to `etl_rejected_rows` for business question 6. |
-| Transform | Standardise (trim, case, payment-mode aliases), dedupe customers and products (D4), mask email and phone, join orders to the three dimensions with a left join plus an assertion that no key is missing, derive `order_date`, `net_revenue`, `gross_margin`, `within_15_min`. |
+| Transform | Standardise (trim, case, payment-mode aliases), dedupe customers and products (D4), mask email and phone, join orders to the three dimensions with a left join plus an assertion that no key is missing, derive `order_date`, `net_revenue`, `gross_margin` (NULL when the product's cost failed its checks, D3), `within_15_min`, and flag each order with its `product_dq_status`. |
 | Load | One DuckDB transaction replaces the whole star (`CREATE OR REPLACE TABLE` ×4), so a reader never sees a half-loaded star and a re-run gives identical tables. Afterwards it asserts that `order_id` is unique in the fact. |
 | Reconcile | `etl_payment_reconciliation`: one row per order/payment mismatch with a reason (section 5.3). |
 | Report | `etl_daily_zone_revenue` and `etl_category_margin`, printed in the task log with totals. |
-| Run audit | Writes this run's `dq_results` (every check, plus the volume check) and its `pipeline_runs` row; keeps a failed run red (section 10). |
+| Run audit | Writes this run's `dq_results` (every check, the volume check and the source-file check, so even a run that fails at extract has a scorecard) and its `pipeline_runs` row; keeps a failed run red (section 10). |
 
 Intermediate DataFrames travel between tasks as pickle files under `include/tmp/samarth/<run_id>/` (pyarrow is not installed in the image, so not Parquet); XCom carries only paths, counts and check results. The folder is deleted when a run succeeds and kept after a failure, so a Clear can resume.
 
@@ -197,13 +199,15 @@ Intermediate DataFrames travel between tasks as pickle files under `include/tmp/
 
 | Table | Grain | Columns |
 |---|---|---|
-| `etl_fact_orders` | one row per valid order | order_id, order_ts, order_date, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes, net_revenue, gross_margin, within_15_min, source_file, source_row, run_id, loaded_at |
+| `etl_fact_orders` | one row per valid order | order_id, order_ts, order_date, customer_id, store_id, product_id, quantity, unit_price, discount_pct, order_amount, payment_mode, order_status, channel, delivery_minutes, net_revenue, gross_margin, within_15_min, product_dq_status, source_file, source_row, run_id, loaded_at |
 | `etl_dim_customer` | one row per customer_id | customer_id, email_masked, phone_masked, city, area, loyalty_tier, signup_date, is_active, dq_status, failure_reason, warning_reason |
 | `etl_dim_product` | one row per product_id | product_id, product_name, category, sub_category, brand, mrp, cost_price, unit, is_perishable, launch_date, dq_status, failure_reason, warning_reason |
 | `etl_dim_store` | one row per store_id | store_id, store_name, zone, area, pincode, open_date, capacity_orders_per_day, dq_status, failure_reason, warning_reason |
 | `etl_rejected_rows` | one row per quarantined row per run (history) | run_id, dag_id, run_date_ist, file_name, row_key, failure_reason, rejected_at |
 
-The fact holds only orders that passed every Critical check (acceptance criterion 2). A dimension holds one canonical row per key, **including** a master row that failed its own checks (for example P0060, blank category): that row is also written to the quarantine file, and it carries `dq_status = 'FAIL'` with its reason in the dimension. This is how decision D7 is implemented: the 126 orders on such products stay in the fact and still join to a product row, with a blank category shown as `Unknown`. Extra duplicate copies never reach a dimension.
+The fact holds only orders that passed every Critical check (acceptance criterion 2). A dimension holds one canonical row per key, **including** a master row that failed its own checks (for example P0060, blank category): that row is also written to the quarantine file, and it carries `dq_status = 'FAIL'` with its reason in the dimension. This is how decision D7 is implemented: the 116 valid orders on such products stay in the fact (₹64,787.10 of revenue) and still join to a product row, with a blank category shown as `Unknown`. Each carries `product_dq_status = 'FAIL'`, and where the failed check was on the cost (66 delivered orders, ₹25,075.45), `gross_margin` is NULL rather than computed from a cost we have already rejected. Extra duplicate copies never reach a dimension.
+
+What the finance guarantee covers, precisely: every order in the fact passed every Critical **order** check, and no figure is computed from a master attribute that failed its own check (no margin from a failed cost; no category from a blank one).
 
 Money columns are `DECIMAL(12,2)`. No reporting table contains `email`, `phone` or `full_name`.
 
@@ -238,7 +242,7 @@ The payment feed's last day is the latest `payment_ts` among payments for valid 
 | stores.csv | 15 | 15 | 1 | 0 |
 | **Total** | **5,212** | | | **151** |
 
-`etl_fact_orders`: 2,308 orders (2,086 DELIVERED, 154 CANCELLED, 68 RETURNED). September net revenue **₹11,34,962.80**, gross margin **₹2,60,826.90**. `etl_payment_reconciliation`: 184 rows (AMOUNT_MISMATCH 13, DUPLICATE_PAYMENT_ID 4, MISSING_PAYMENT 27, ORDER_NOT_FOUND 8, ORDER_REJECTED 90, PAYMENT_FAILED 42).
+`etl_fact_orders`: 2,308 orders (2,086 DELIVERED, 154 CANCELLED, 68 RETURNED). September net revenue **₹11,34,962.80**; gross margin **₹2,66,627.75** on orders with a trusted cost, plus **₹25,075.45** of revenue (66 orders) with no margin because the product's cost failed. `etl_payment_reconciliation`: 184 rows (AMOUNT_MISMATCH 13, DUPLICATE_PAYMENT_ID 4, MISSING_PAYMENT 27, ORDER_NOT_FOUND 8, ORDER_REJECTED 90, PAYMENT_FAILED 42).
 
 ## 6. Part B: ELT pipeline
 
@@ -266,7 +270,7 @@ The six `check_*` tasks (file present, header as expected, row count) don't touc
 | Staging | `stg_stores`, `stg_products`, `stg_customers`, `stg_orders`, `stg_payments`, `stg_rejected_duplicates` | `20`–`27_*.sql`: cast types, standardise, keep one canonical row per key (extra copies → `stg_rejected_duplicates`), mask email and phone, apply every rule from section 7, set `dq_status` (PASS/WARN/FAIL), `failure_reason`, `warning_reason`. Original text of parsed columns is kept as `<column>_raw`. No staging table has `email`, `phone` or `full_name`. |
 | Mart | `mart_daily_store_kpis`, `mart_category_margin`, `mart_delivery_sla`, `mart_payment_reconciliation`, `mart_top_customers` | `40`–`44_mart_*.sql`, built only from staging rows with `dq_status` PASS or WARN. |
 
-Staging and marts read **only this run's raw batch** (`WHERE _run_id = <this run>`, decision D11). The raw layer keeps every batch: it is the audit log. A retry or Clear of the same run first deletes that run's own batch for the file, so it is never loaded twice; no other run's rows are ever deleted.
+Staging and marts read **only this run's raw batch** (`WHERE _run_id = <this run>`, decision D11). The raw layer keeps every batch: it is the audit log, and nothing in the pipeline ever deletes or updates a raw row. A retry or Clear of the same run checks whether this run's batch for the file is already there; if so it keeps it and skips the load, so a file is never loaded twice and never re-written. Each file load is one transaction, so a batch is either complete or absent. (Tested: a Clear of `load_raw` left the batch's 2,412 rows and their `_loaded_at` unchanged; the log says "already loaded by this run (kept)".)
 
 ### 6.3 Incremental load with MERGE
 
@@ -287,10 +291,11 @@ Both pipelines were run on the same input, then compared row by row (`EXCEPT` bo
 | Orders passing (September files) | 2,308 | 2,308 | yes, same `order_id` set and same values |
 | Delivered orders | 2,086 | 2,086 | yes |
 | September net revenue | ₹11,34,962.80 | ₹11,34,962.80 | yes |
-| Gross margin | ₹2,60,826.90 | ₹2,60,826.90 | yes |
+| Gross margin (trusted cost) | ₹2,66,627.75 | ₹2,66,627.75 | yes |
+| Revenue with no margin (product cost failed) | ₹25,075.45 | ₹25,075.45 | yes |
 | Rows set aside (quarantine / FAIL + duplicates) | 151 | 151 | yes, per file |
 | Reconciliation rows | 184 | 184 | yes, identical rows and reasons |
-| `dq_results` | 41 checks | 41 checks | identical counts and statuses |
+| `dq_results` | 44 checks | 44 checks | identical counts and statuses |
 | Masked customers | 400 | 400 | identical masked email/phone/tier |
 | After the increment: orders passing | 2,458 | 2,458 | yes |
 | After the increment: net revenue (current-restated) | ₹12,10,421.30 | ₹12,10,421.30 | yes |
@@ -323,11 +328,12 @@ Every check below runs in both pipelines with the same `check_name` (pandas in `
 | `customers_phone_10_digits` | Validity | Warning | `^\d{10}$` (`invalid_phone`) |
 | `customers_pincode_6_digits` / `stores_pincode_6_digits` | Validity | Warning | `^\d{6}$` (`invalid_pincode`) |
 | `orders_quantity_positive` | Accuracy | Critical | integer and > 0 (`invalid_quantity`, `nonpositive_quantity`) |
+| `orders_unit_price_positive` | Accuracy | Critical | unit_price > 0 (`nonpositive_unit_price`): a negative price with a matching negative amount would otherwise pass the formula check |
 | `orders_amount_formula` | Accuracy | Critical | \|round(quantity × unit_price × (1 − discount_pct/100), 2) − order_amount\| ≤ 0.01 (`order_amount_mismatch`) |
-| `orders_delivery_max` | Accuracy | Critical | delivery_minutes integer and ≤ 120 (`invalid_delivery_minutes`, `delivery_minutes_over_120`) |
-| `orders_delivery_normal_range` | Accuracy | Warning | outside 8–35 but ≤ 120 (`delivery_minutes_outside_8_35`) |
+| `orders_delivery_max` | Accuracy | Critical | delivery_minutes integer, ≥ 0 and ≤ 120 (`invalid_delivery_minutes`, `negative_delivery_minutes`, `delivery_minutes_over_120`) |
+| `orders_delivery_normal_range` | Accuracy | Warning | outside 8–35 but within 0–120 (`delivery_minutes_outside_8_35`) |
 | `payments_amount_positive` | Accuracy | Critical | SUCCESS ⇒ amount_paid > 0 (`nonpositive_amount_paid`) |
-| `products_mrp_positive` / `products_cost_le_mrp` | Accuracy | Critical | mrp > 0 (`nonpositive_mrp`); cost_price ≤ mrp (`cost_above_mrp`) |
+| `products_mrp_positive` / `products_cost_positive` / `products_cost_le_mrp` | Accuracy | Critical | mrp > 0 (`nonpositive_mrp`); cost_price > 0 (`nonpositive_cost_price`); cost_price ≤ mrp (`cost_above_mrp`). A product failing any of these three gives its orders no margin (D3) |
 | `orders_fk_customer` / `orders_fk_product` / `orders_fk_store` | Consistency | Critical | key exists in the source master file (`unknown_customer_id`, …); a master row failing its own checks does not fail the order (D7) |
 | `payments_fk_order` | Consistency | Critical | order_id exists in an orders file (`unknown_order_id`) |
 | `payments_amount_matches_order` | Consistency | Warning | SUCCESS amount = order_amount ± 0.01 (`amount_differs_from_order`); also a reconciliation row |
@@ -335,8 +341,9 @@ Every check below runs in both pipelines with the same `check_name` (pandas in `
 | `orders_not_future` / `payments_not_future` / `customers_signup_not_future` | Timeliness | Critical | not later than the run's start time in IST (`future_order_ts`, …) |
 | `orders_freshness` | Timeliness | Warning | latest valid order_ts within 24 h of the reference time (D10; dataset-level: rows_checked = 1) |
 | header check (extract task) | Schema | fails the task | every expected column present; missing/renamed → `AirflowFailException`, extra → logged warning |
+| `source_files_schema` | Validity (schema) | Critical | written by `audit_run` on **every** run: how many source files arrived with their expected columns (rows_checked / rows_failed count files). A run that fails at extract therefore still has a `dq_results` row |
 
-`dq_results` gets one row per check per run, including checks with zero failures (41 rows per ETL run). `status = 'FAIL'` means "rows were quarantined", not "the DAG failed"; `WARN` means a Warning check found rows.
+`dq_results` gets one row per check per run, including checks with zero failures: 44 rows per run in each pipeline, identical between them. A run that fails before validation records `source_files_schema` (FAIL) only, because no other check could run. `status = 'FAIL'` means "rows were quarantined", not "the DAG failed"; `WARN` means a Warning check found rows.
 
 ## 8. Part C: Scheduling
 
@@ -456,43 +463,45 @@ SELECT zone, SUM(net_revenue) AS net_revenue FROM mart_daily_store_kpis GROUP BY
 
 ### Q2. Revenue and gross margin by product category (margin = revenue − quantity × cost_price)
 
+`gross_margin` uses only orders whose product cost passed its checks (decision D3); `revenue_cost_untrusted` is the revenue whose margin can't be computed honestly.
+
 **ETL**
 
 ```sql
-SELECT p.category, SUM(f.net_revenue) AS revenue,
-       SUM(f.net_revenue - f.quantity * p.cost_price) AS gross_margin
+SELECT p.category, SUM(f.net_revenue) AS revenue, SUM(f.gross_margin) AS gross_margin,
+       COALESCE(SUM(f.net_revenue) FILTER (WHERE f.gross_margin IS NULL), 0) AS revenue_cost_untrusted
 FROM etl_fact_orders f JOIN etl_dim_product p USING (product_id)
 WHERE f.order_status = 'DELIVERED'
 GROUP BY 1 ORDER BY revenue DESC;
 ```
 
-| category | revenue | gross_margin |
-|---|---:|---:|
-| Staples | 266,500.90 | 58,728.22 |
-| Personal Care | 205,016.80 | 44,444.98 |
-| Household | 199,321.45 | 51,031.69 |
-| Dairy & Bakery | 169,528.75 | 44,791.84 |
-| Snacks & Beverages | 161,598.95 | 37,665.60 |
-| Fruits & Vegetables | 93,284.30 | 19,600.62 |
-| Unknown | 39,711.65 | 4,563.95 |
+| category | revenue | gross_margin | revenue_cost_untrusted |
+|---|---:|---:|---:|
+| Staples | 266,500.90 | 62,906.27 | 16,195.55 |
+| Personal Care | 205,016.80 | 44,571.78 | 3,511.90 |
+| Household | 199,321.45 | 51,031.69 | 0.00 |
+| Dairy & Bakery | 169,528.75 | 44,791.84 | 0.00 |
+| Snacks & Beverages | 161,598.95 | 37,665.60 | 0.00 |
+| Fruits & Vegetables | 93,284.30 | 21,096.62 | 5,368.00 |
+| Unknown | 39,711.65 | 4,563.95 | 0.00 |
 
 **ELT**
 
 ```sql
-SELECT category, revenue, gross_margin FROM mart_category_margin ORDER BY revenue DESC;
+SELECT category, revenue, gross_margin, revenue_cost_untrusted FROM mart_category_margin ORDER BY revenue DESC;
 ```
 
-| category | revenue | gross_margin |
-|---|---:|---:|
-| Staples | 266,500.90 | 58,728.22 |
-| Personal Care | 205,016.80 | 44,444.98 |
-| Household | 199,321.45 | 51,031.69 |
-| Dairy & Bakery | 169,528.75 | 44,791.84 |
-| Snacks & Beverages | 161,598.95 | 37,665.60 |
-| Fruits & Vegetables | 93,284.30 | 19,600.62 |
-| Unknown | 39,711.65 | 4,563.95 |
+| category | revenue | gross_margin | revenue_cost_untrusted |
+|---|---:|---:|---:|
+| Staples | 266,500.90 | 62,906.27 | 16,195.55 |
+| Personal Care | 205,016.80 | 44,571.78 | 3,511.90 |
+| Household | 199,321.45 | 51,031.69 | 0.00 |
+| Dairy & Bakery | 169,528.75 | 44,791.84 | 0.00 |
+| Snacks & Beverages | 161,598.95 | 37,665.60 | 0.00 |
+| Fruits & Vegetables | 93,284.30 | 21,096.62 | 5,368.00 |
+| Unknown | 39,711.65 | 4,563.95 | 0.00 |
 
-**Match:** yes. Total revenue ₹11,34,962.80, gross margin ₹2,60,826.90. `Unknown` = orders of P0051/P0060/P0068, whose category is blank in the catalogue; the orders are valid sales so they are kept (decision D7).
+**Match:** yes. Total revenue ₹11,34,962.80; gross margin **₹2,66,627.75** on trusted costs; **₹25,075.45** of revenue (66 orders on P0019, P0073, P0074, P0109, P0117, whose cost exceeds the MRP or whose MRP is negative) has no margin rather than a wrong one. Before this rule, those orders contributed −₹5,800.85 of margin computed from costs the pipeline had itself rejected. `Unknown` = orders of P0051/P0060/P0068, whose category is blank in the catalogue; their cost is valid, so their margin counts (decision D7).
 
 ### Q3. Average delivery time per store, and % of delivered orders within 15 minutes
 
@@ -805,7 +814,7 @@ UNION ALL SELECT 'stores', COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT 
 
 `audit_run` is the last task of each DAG, with `trigger_rule="all_done"`, so it runs even after a failure. It records what happened in two tables, both with delete-then-insert on `(dag_id, run_id)` so a Clear or retry replaces the rows instead of duplicating them:
 
-- `dq_results`: in the ETL, `audit_run` writes every check from the validate step plus the volume check, so the scorecard is saved even when transform or load fails. In the ELT the checks are SQL, so `transform_staging` writes them (`30_dq_results_elt.sql`).
+- `dq_results`: in the ETL, `audit_run` writes every check from the validate step plus the volume check, so the scorecard is saved even when transform or load fails. In the ELT the checks are SQL, so `transform_staging` writes them (`30_dq_results_elt.sql`). In **both**, `audit_run` also writes `source_files_schema` on every run, so a run that fails before validation (missing file, renamed column) still leaves a scorecard row: tested with the renamed-column input, both DAGs recorded `source_files_schema` FAIL, 1 of 5 files.
 - `pipeline_runs`: one row per run, defined below.
 
 | Column | ETL | ELT |
@@ -820,6 +829,7 @@ Task code cannot query Airflow's metadata database in Airflow 3, so the audit ta
 
 ### 10.2 How the experiments were run
 
+- The experiments were run before four later improvements: three extra Critical checks (positive unit price, positive cost price, non-negative delivery time), the trusted-cost margin (D3), the per-run `source_files_schema` row, and raw batches that are kept rather than reloaded on a retry. None of those fixes changes an experiment's outcome: no source row has a non-positive price or cost or a negative delivery time, and revenue is unchanged. Today Experiments 4 and 6 would additionally leave a `source_files_schema` FAIL row in `dq_results`, and a Clear of `load_raw` keeps the existing raw batch instead of re-loading it.
 - Inputs were never edited by hand. `include/nammamart/make_experiment_fixtures.py` copies the five base files into `include/data/nammamart_experiments/<experiment>/` (gitignored) and applies exactly one change per folder.
 - Each run was triggered through the scheduler with config, for example `{"data_dir": "include/data/nammamart_experiments/exp05_bad_rows", "as_of_date": "2026-10-01"}`. ETL first, then ELT.
 - "Restore the original file" = the next run uses the default `data_dir`. Every run rebuilds its outputs from the files it is given (D11), so a happy-path run after each experiment restored every table. For Experiment 3 the increment was copied into `include/data/nammamart/` and removed afterwards.
@@ -897,10 +907,11 @@ A change to a quality rule, such as the 120-minute delivery limit, is **proposed
 | payment_mode | VARCHAR | Standardised payment mode | orders.payment_mode | UPI, Card, Cash on Delivery, Wallet | No |
 | order_status | VARCHAR | Current status (after increments) | orders.order_status | DELIVERED, CANCELLED, RETURNED | No |
 | channel | VARCHAR | Ordering channel | orders.channel | App, Web | No |
-| delivery_minutes | INTEGER | Minutes from order to delivery | orders.delivery_minutes | required if DELIVERED; ≤ 120 | No |
+| delivery_minutes | INTEGER | Minutes from order to delivery | orders.delivery_minutes | required if DELIVERED; 0–120 | No |
 | net_revenue | DECIMAL(12,2) | Revenue counted: `order_amount` if DELIVERED, else 0 | derived | ≥ 0 | No |
-| gross_margin | DECIMAL(12,2) | `net_revenue − quantity × cost_price` if DELIVERED, else 0 | derived (with products.cost_price) | — | No |
+| gross_margin | DECIMAL(12,2) | `net_revenue − quantity × cost_price` if DELIVERED, else 0; **NULL** when the product failed a cost check (cost not trusted) | derived (with products.cost_price) | — | No |
 | within_15_min | BOOLEAN | DELIVERED and `delivery_minutes ≤ 15` | derived | — | No |
+| product_dq_status | VARCHAR | Quality status of the order's product row (the order itself passed) | etl_dim_product.dq_status | PASS / WARN / FAIL | No |
 | source_file, source_row, run_id, loaded_at | VARCHAR / INTEGER / VARCHAR / TIMESTAMP | Lineage: file, data line, Airflow run, load time | pipeline | — | No |
 
 **`etl_dim_customer`** (ELT: `stg_customers`)
@@ -926,7 +937,7 @@ A change to a quality rule, such as the 120-minute delivery limit, is **proposed
 | product_name, sub_category, brand, unit | VARCHAR | Descriptive attributes | products | — | No |
 | category | VARCHAR | Category; blank → `Unknown` | products.category | 6 categories or Unknown | No |
 | mrp | DECIMAL(12,2) | Maximum retail price, ₹ | products.mrp | > 0 | No |
-| cost_price | DECIMAL(12,2) | Cost to NammaMart, ₹ | products.cost_price | ≤ mrp | No |
+| cost_price | DECIMAL(12,2) | Cost to NammaMart, ₹ | products.cost_price | > 0 and ≤ mrp | No |
 | is_perishable | BOOLEAN | Perishable item | products.is_perishable | — | No |
 | launch_date | DATE | Launch date | products.launch_date | — | No |
 | dq_status, failure_reason, warning_reason | VARCHAR | Product check results (FAIL rows stay so their orders join) | pipeline | PASS / WARN / FAIL | No |
@@ -969,8 +980,9 @@ Personal data in the dataset:
 How it is handled:
 
 - **Masked:** `email` and `phone`, by the same rule in Python (`masking.py`) and SQL (`23_stg_customers.sql`). Invalid emails become NULL rather than being echoed back.
-- **Not loaded at all** into any reporting table: `full_name`, `pincode`, `manager_name`.
-- **Clear values exist only** in `include/data/` (source files), `raw_customers` and the quarantine files.
+- **Not loaded at all** into any reporting or staging table: `full_name`, customer `pincode`, `manager_name`, `gateway_ref` (they stay in the raw layer only).
+- **Clear values exist only** in: `include/data/` (source files); `raw_customers` in the warehouse; the customers quarantine file; and the ETL's intermediate files under `include/tmp/samarth/<run>/`, which hold raw rows while a run is in progress (deleted when the run succeeds, kept after a failure so a Clear can resume). Everything except the source files is gitignored.
+- **Not printed anywhere:** task logs show counts and keys only, and the Part 0 profiler reports invalid emails and phones by `customer_id` and pattern (e.g. "missing @", "9 digits"), never by value.
 
 **Why mask rather than delete:** analysts still need to tell customers apart (top-customer ranking, duplicate detection, support look-ups by partial email), and finance needs to answer "whose order was this?" without seeing the full contact details. Masking keeps that usefulness while removing the ability to contact or identify the person from the report (data minimisation).
 
@@ -1050,7 +1062,7 @@ Example: ORD000017 (₹16.00) and the other 9 corrections in the increment (₹4
 
 I built both pipelines on the same five exports and ran them side by side, including ten failure experiments each. The evidence:
 
-- **Data quality guarantee: a tie.** Both produced exactly the same finance numbers: 2,308 valid orders, September net revenue ₹11,34,962.80, gross margin ₹2,60,826.90, the same 151 rows rejected and the same 184 payment mismatches. Comparing row by row found zero differences. ELT gives finance the same "no bad row in the report" guarantee as ETL, because every mart reads only rows that passed every critical check.
+- **Data quality guarantee: a tie.** Both produced exactly the same finance numbers: 2,308 valid orders, September net revenue ₹11,34,962.80, gross margin ₹2,66,627.75 on trusted costs (with ₹25,075.45 of revenue shown without a margin because its product cost failed), the same 151 rows rejected and the same 184 payment mismatches. Comparing row by row found zero differences. ELT gives finance the same guarantee as ETL: every mart reads only orders that passed every Critical order check, and no figure is computed from a master attribute that failed its own check.
 - **Auditability: ELT wins.** When finance asks "show me this rejected order as received, the rule it broke, and prove it's not in the total", ELT answers with three queries in one place. ETL needs the warehouse plus a quarantine file on disk. ELT also traced a report cell (14 Sept, store S05, ₹1,649.50) back to the exact five file lines with SQL alone.
 - **History: ELT wins.** When the 1 October file turned 10 September orders into returns, both pipelines restated September revenue (−₹4,193.70). Only ELT still holds the September figure as originally reported, because raw keeps every day's data. That's what finance needs to freeze a closed month.
 - **Ease of change: ELT is simpler.** A rule change, such as the 120-minute delivery limit, is one line in one SQL file and can be re-run on yesterday's raw data to see its effect before go-live. In ETL the rule lives in Python and the old data has to be re-read from files.
@@ -1117,5 +1129,7 @@ No unmasked email or phone appears in any screenshot. The quarantine example is 
 - **Warnings don't block publication.** Volume and freshness are Warning checks, as the assignment suggests. Experiments 7 and 9 showed the report is still replaced.
 - **Rules are written twice** (pandas and SQL). They are kept identical by sharing `config.py` and by the row-by-row parity check; a future change must touch both.
 - **Each run reprocesses the full files** (decision D11). That is right for daily exports of this size, but it won't scale 1000× (Part G).
+- **Applied increments live in the landing folder, not in the warehouse state.** Because every run rebuilds from the files present (D11), an increment's 150 new orders and 10 returns persist only while `orders_2026-10-01_increment.csv` stays in `include/data/nammamart/`; a later run without it rebuilds September as it was. The MERGE itself is correct; what is not persisted is the result between runs. This was a deliberate choice: it keeps every run, retry and experiment reproducible from its inputs and lets "restore the original file" restore every table. A production load would instead keep `stg_orders` (or the fact) between runs and MERGE only files newer than a stored watermark, with the raw layer as the replay source.
+- **66 delivered orders have no gross margin** (₹25,075.45 of revenue) because their product's cost failed its checks (cost above MRP, or a negative MRP). The fix is upstream: the catalogue team must correct P0019, P0073, P0074, P0109 and P0117.
 - **DuckDB is single-writer.** The two DAGs take turns through the one-slot pool. Querying the warehouse while a run is in progress blocks the run.
 - **The client questions in Part 0 are unanswered,** so the pipeline uses the documented defaults: S07's zone is `Unknown`, zero/negative quantities are rejected, and returns restate September revenue.

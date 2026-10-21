@@ -82,6 +82,21 @@ def write_dq_results(con, run: dict, results: list[dict]) -> None:
         con.unregister("dq_df")
 
 
+def write_dq_check(con, run: dict, result: dict) -> None:
+    """Upsert one check's row for this run (used by the ELT audit, whose other checks are written in SQL)."""
+    con.begin()
+    try:
+        con.execute("DELETE FROM dq_results WHERE run_id = ? AND dag_id = ? AND check_name = ?",
+                    [run["run_id"], run["dag_id"], result["check_name"]])
+        con.execute("INSERT INTO dq_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(now() AS TIMESTAMP))",
+                    [run["run_id"], run["dag_id"], result["check_name"], result["dimension"], result["severity"],
+                     result["rows_checked"], result["rows_failed"], result["status"]])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+
+
 def upsert_pipeline_run(con, row: dict) -> None:
     con.begin()
     try:

@@ -1,6 +1,6 @@
 -- STAGING: products. One row per product_id (first copy in file order: orders are priced at the
 -- first copy's mrp for P0030 and P0140).
--- Critical rules: products_category_present, products_mrp_positive, products_cost_le_mrp.
+-- Critical rules: products_category_present, products_mrp_positive, products_cost_positive, products_cost_le_mrp.
 -- A product that fails stays in stg_products with dq_status = 'FAIL' so its orders still join (decision D7).
 
 INSERT INTO stg_rejected_duplicates
@@ -23,7 +23,8 @@ checked AS (
         NULLIF(concat_ws(';',
             CASE WHEN TRIM(category) = '' THEN 'missing_category' END,
             CASE WHEN mrp_num IS NULL OR mrp_num <= 0 THEN 'nonpositive_mrp' END,
-            CASE WHEN cost_num IS NULL OR cost_num > mrp_num THEN 'cost_above_mrp' END
+            CASE WHEN cost_num IS NULL OR cost_num <= 0 THEN 'nonpositive_cost_price' END,
+            CASE WHEN cost_num > mrp_num THEN 'cost_above_mrp' END
         ), '') AS fr,
         CAST(NULL AS VARCHAR) AS wr
     FROM src

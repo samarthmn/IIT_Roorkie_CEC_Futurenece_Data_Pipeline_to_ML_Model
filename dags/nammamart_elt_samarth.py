@@ -119,15 +119,17 @@ def nammamart_elt_samarth():
         with warehouse.connect() as con:
             warehouse.run_sql_file(con, "10_raw_create.sql")
             for f in files:
-                rows = elt.load_raw_file(con, f["path"], f["file"], run)
-                loaded.append({"file": f["file"], "table": elt.raw_table(f["file"]), "rows": rows})
+                rows, inserted = elt.load_raw_file(con, f["path"], f["file"], run)
+                loaded.append({"file": f["file"], "table": elt.raw_table(f["file"]), "rows": rows,
+                               "inserted": inserted})
             batches = con.execute("SELECT COUNT(DISTINCT _run_id) FROM raw_orders").fetchone()[0]
 
         logs.section(f"LOAD RAW  run {run['run_id']}")
-        logs.table([{"file": x["file"], "raw table": x["table"], "rows inserted": logs.num(x["rows"])}
+        logs.table([{"file": x["file"], "raw table": x["table"], "rows": logs.num(x["rows"]),
+                     "this attempt": "inserted" if x["inserted"] else "already loaded by this run (kept)"}
                     for x in loaded])
-        logs.kv({"rows inserted this run": logs.num(sum(x["rows"] for x in loaded)),
-                 "check": "rows inserted = data rows in each file",
+        logs.kv({"rows in this run's raw batch": logs.num(sum(x["rows"] for x in loaded)),
+                 "check": "rows loaded = data rows in each file",
                  "raw_orders batches kept": f"{batches} (raw is append-only: one batch per run)"})
         return {"files": loaded, "rows_loaded": sum(x["rows"] for x in loaded)}
 
@@ -246,9 +248,12 @@ def nammamart_elt_samarth():
 
         logs.section("mart_category_margin")
         logs.table([{"category": r.category, "orders": logs.num(r.delivered_orders), "revenue": logs.money(r.revenue),
-                     "cost": logs.money(r.cost), "gross margin": logs.money(r.gross_margin),
-                     "margin %": f"{r.margin_pct:.2f}%"} for r in category.itertuples()])
-        logs.kv({"total gross margin": logs.money(category["gross_margin"].sum())})
+                     "cost": logs.money(r.cost or 0), "gross margin": logs.money(r.gross_margin or 0),
+                     "margin %": f"{r.margin_pct:.2f}%", "revenue, cost failed": logs.money(r.revenue_cost_untrusted)}
+                    for r in category.itertuples()])
+        logs.kv({"total gross margin": logs.money(category["gross_margin"].sum()) + "  (on orders with a trusted cost)",
+                 "revenue with no margin": logs.money(category["revenue_cost_untrusted"].sum())
+                                           + "  (product cost failed its checks)"})
 
         logs.section("mart_delivery_sla")
         logs.table([{"store": r.store_id, "name": r.store_name, "zone": r.zone, "delivered": logs.num(r.delivered_orders),
@@ -271,12 +276,16 @@ def nammamart_elt_samarth():
     @task(pool=config.POOL, trigger_rule="all_done")
     def audit_run() -> None:
         from airflow.sdk.exceptions import AirflowFailException
-        from include.nammamart import logs, warehouse
+        from include.nammamart import logs, quality, warehouse
 
         ctx = get_current_context()
         ti, run = ctx["ti"], _run()
         outputs = {t: ti.xcom_pull(task_ids=t) for t in PIPELINE_TASKS}
         failed = [t for t, v in outputs.items() if v is None]
+        increments = outputs["check_increments"]
+        source_check = quality.source_files_check(
+            files_checked=5 + len(increments or []) + (increments is None),
+            files_failed=sum(outputs[t] is None for t in PIPELINE_TASKS[:6]))
 
         checks = [outputs[t] for t in PIPELINE_TASKS[:5] if outputs[t]] + (outputs["check_increments"] or [])
         staged = outputs["transform_staging"] or {}
@@ -295,14 +304,21 @@ def nammamart_elt_samarth():
         try:
             with warehouse.connect() as con:
                 warehouse.ensure_control_tables(con)
+                warehouse.write_dq_check(con, run, source_check)   # every run, even an early failure
                 warehouse.upsert_pipeline_run(con, row)
         except Exception as exc:                       # never hide the original failure
             write_error = exc
             print(f"  could not write to the warehouse: {exc!r}")
+        logs.section("AUDIT  dq_results")
+        logs.kv({"source files": f"{source_check['rows_checked'] - source_check['rows_failed']} of "
+                                 f"{source_check['rows_checked']} present with the expected columns "
+                                 f"-> {source_check['status']}",
+                 "other checks": "written by transform_staging (30_dq_results_elt.sql)"
+                                 if outputs["transform_staging"] else "not run (staging did not run)"})
         logs.section("AUDIT  pipeline_runs")
         logs.kv({k: logs.num(v) if k.startswith("rows_") else str(v)[:19] if k.endswith("_time") else v
                  for k, v in row.items()})
-        print("  rows_loaded = rows inserted into raw_*; rows_quarantined = staging FAIL rows + extra duplicate copies")
+        print("  rows_loaded = rows in this run's raw batch; rows_quarantined = staging FAIL rows + extra duplicate copies")
         if failed:
             print(f"  tasks without a result: {', '.join(failed)}")
             raise AirflowFailException(f"Run failed; tasks without a result: {failed}")

@@ -29,3 +29,4 @@ include/tmp/
 include/data/nammamart_experiments/
 include/reports/*.md
 include/reports/*.txt
+!include/reports/profile_report.md

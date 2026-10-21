@@ -256,7 +256,9 @@ def nammamart_etl_samarth():
         delivered = fact[fact["order_status"] == "DELIVERED"]
         logs.kv({"delivered orders": logs.num(len(delivered)),
                  "net revenue": logs.money(delivered["net_revenue"].sum()),
-                 "gross margin": logs.money(delivered["gross_margin"].sum())})
+                 "gross margin": logs.money(delivered["gross_margin"].sum()) + "  (orders with a trusted cost)",
+                 "revenue with no margin": logs.money(delivered.loc[delivered["gross_margin"].isna(), "net_revenue"].sum())
+                                           + f"  ({int(delivered['gross_margin'].isna().sum())} orders: product cost failed)"})
         return {"validation": v, "tables": tables}
 
     # ── LOAD (idempotent: the whole star is replaced in one transaction) ──────
@@ -312,7 +314,7 @@ def nammamart_etl_samarth():
                            CAST(delivery_minutes AS INTEGER) AS delivery_minutes,
                            CAST(net_revenue AS DECIMAL(12,2)) AS net_revenue,
                            CAST(gross_margin AS DECIMAL(12,2)) AS gross_margin,
-                           within_15_min, source_file, CAST(source_row AS INTEGER) AS source_row, run_id,
+                           within_15_min, product_dq_status, source_file, CAST(source_row AS INTEGER) AS source_row, run_id,
                            CAST(now() AS TIMESTAMP) AS loaded_at
                     FROM df_fact_orders;
 
@@ -398,8 +400,11 @@ def nammamart_etl_samarth():
 
                 CREATE OR REPLACE TABLE etl_category_margin AS
                 SELECT p.category, COUNT(*) AS delivered_orders, SUM(f.net_revenue) AS revenue,
-                       SUM(f.quantity * p.cost_price) AS cost, SUM(f.gross_margin) AS gross_margin,
-                       ROUND(100 * SUM(f.gross_margin) / NULLIF(SUM(f.net_revenue), 0), 2) AS margin_pct
+                       SUM(f.quantity * p.cost_price) FILTER (WHERE f.gross_margin IS NOT NULL) AS cost,
+                       SUM(f.gross_margin) AS gross_margin,
+                       ROUND(100 * SUM(f.gross_margin)
+                             / NULLIF(SUM(f.net_revenue) FILTER (WHERE f.gross_margin IS NOT NULL), 0), 2) AS margin_pct,
+                       COALESCE(SUM(f.net_revenue) FILTER (WHERE f.gross_margin IS NULL), 0) AS revenue_cost_untrusted
                 FROM etl_fact_orders f JOIN etl_dim_product p USING (product_id)
                 WHERE f.order_status = 'DELIVERED'
                 GROUP BY ALL ORDER BY revenue DESC;
@@ -409,10 +414,13 @@ def nammamart_etl_samarth():
         from include.nammamart import logs
         logs.section("REPORT  etl_category_margin  (DELIVERED orders)")
         logs.table([{"category": r.category, "orders": logs.num(r.delivered_orders), "revenue": logs.money(r.revenue),
-                     "cost": logs.money(r.cost), "gross margin": logs.money(r.gross_margin),
-                     "margin %": f"{r.margin_pct:.2f}%"} for r in category.itertuples()])
+                     "cost": logs.money(r.cost or 0), "gross margin": logs.money(r.gross_margin or 0),
+                     "margin %": f"{r.margin_pct:.2f}%", "revenue, cost failed": logs.money(r.revenue_cost_untrusted)}
+                    for r in category.itertuples()])
         logs.kv({"total revenue": logs.money(category["revenue"].sum()),
-                 "total gross margin": logs.money(category["gross_margin"].sum())})
+                 "total gross margin": logs.money(category["gross_margin"].sum()) + "  (on orders with a trusted cost)",
+                 "revenue with no margin": logs.money(category["revenue_cost_untrusted"].sum())
+                                           + "  (product cost failed its checks)"})
 
         logs.section(f"REPORT  etl_daily_zone_revenue  ({len(zone):,} rows: date x zone x store)")
         by_zone = zone.groupby("zone", as_index=False)[["delivered_orders", "net_revenue"]].sum()
@@ -444,6 +452,10 @@ def nammamart_etl_samarth():
         extracts = [outputs[t] for t in PIPELINE_TASKS[:5] if outputs[t]] + (outputs["extract_increments"] or [])
         validations = outputs["validate"] or {}
         results = [r for file_v in validations.values() for r in file_v["results"]]
+        increments = outputs["extract_increments"]
+        source_check = quality.source_files_check(
+            files_checked=5 + len(increments or []) + (increments is None),
+            files_failed=sum(outputs[t] is None for t in PIPELINE_TASKS[:6]))
         row = {
             "run_id": run["run_id"], "dag_id": run["dag_id"],
             "start_time": pendulum.instance(ctx["dag_run"].start_date).in_timezone(IST).naive(),
@@ -457,22 +469,27 @@ def nammamart_etl_samarth():
         try:
             with warehouse.connect() as con:
                 warehouse.ensure_control_tables(con)
-                if results:                            # validation ran: record every check
+                volume = "not run (validation did not run)"
+                if results:                            # validation ran: add the volume check
                     orders = validations["orders"]["rows_canonical"]
                     previous = warehouse.previous_rows_checked(con, run["dag_id"], run["run_id"],
                                                                "orders_required_fields")
                     results.append(quality.volume_check(orders, previous))
-                    warehouse.write_dq_results(con, run, results)
-                    summary = {s: sum(r["status"] == s for r in results) for s in ["PASS", "WARN", "FAIL"]}
-                    if not failed and (summary["WARN"] or summary["FAIL"]):
-                        row["status"] = "SUCCESS_WITH_WARNINGS"
-                    logs.section("AUDIT  dq_results (quality scorecard)")
-                    logs.kv({"checks written": f"{len(results)}  (PASS {summary['PASS']}, WARN {summary['WARN']}, "
-                                               f"FAIL {summary['FAIL']})",
-                             "volume check": f"{orders:,} orders this run vs "
-                                             f"{'no previous run' if previous is None else f'{previous:,} last run'}"
-                                             f" -> {results[-1]['status']}"})
-                    print("  FAIL = rows were quarantined; WARN = a Warning check found rows")
+                    volume = (f"{orders:,} orders this run vs "
+                              f"{'no previous run' if previous is None else f'{previous:,} last run'}"
+                              f" -> {results[-1]['status']}")
+                results.append(source_check)           # every run gets a scorecard, even an early failure
+                warehouse.write_dq_results(con, run, results)
+                summary = {s: sum(r["status"] == s for r in results) for s in ["PASS", "WARN", "FAIL"]}
+                if not failed and (summary["WARN"] or summary["FAIL"]):
+                    row["status"] = "SUCCESS_WITH_WARNINGS"
+                logs.section("AUDIT  dq_results (quality scorecard)")
+                logs.kv({"checks written": f"{len(results)}  (PASS {summary['PASS']}, WARN {summary['WARN']}, "
+                                           f"FAIL {summary['FAIL']})",
+                         "source files": f"{source_check['rows_checked'] - source_check['rows_failed']} of "
+                                         f"{source_check['rows_checked']} present with the expected columns",
+                         "volume check": volume})
+                print("  FAIL = rows were quarantined (or a file was missing/broken); WARN = a Warning check found rows")
                 warehouse.upsert_pipeline_run(con, row)
         except Exception as exc:                       # never hide the original failure
             write_error = exc

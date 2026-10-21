@@ -62,10 +62,12 @@ reasons AS (
             -- Accuracy
             CASE WHEN q IS NULL OR q <> ROUND(q) THEN 'invalid_quantity' END,
             CASE WHEN q <= 0 THEN 'nonpositive_quantity' END,
+            CASE WHEN price IS NULL OR price <= 0 THEN 'nonpositive_unit_price' END,
             CASE WHEN amount IS NULL OR expected_amount IS NULL OR ABS(expected_amount - amount) > 0.010000001
                  THEN 'order_amount_mismatch' END,
             CASE WHEN TRIM(delivery_minutes) <> '' AND (minutes IS NULL OR minutes <> ROUND(minutes))
                  THEN 'invalid_delivery_minutes' END,
+            CASE WHEN minutes < 0 THEN 'negative_delivery_minutes' END,
             CASE WHEN minutes > 120 THEN 'delivery_minutes_over_120' END,
             -- Consistency
             CASE WHEN TRIM(customer_id) <> '' AND TRIM(customer_id) NOT IN (SELECT k FROM customer_keys)
@@ -81,7 +83,8 @@ reasons AS (
             CASE WHEN status_std IN ('DELIVERED', 'CANCELLED', 'RETURNED') AND status_std <> order_status
                  THEN 'order_status_standardised' END,
             CASE WHEN mode_std IS NOT NULL AND mode_std <> payment_mode THEN 'payment_mode_standardised' END,
-            CASE WHEN minutes <= 120 AND (minutes < 8 OR minutes > 35) THEN 'delivery_minutes_outside_8_35' END
+            CASE WHEN minutes >= 0 AND minutes <= 120 AND (minutes < 8 OR minutes > 35)
+                 THEN 'delivery_minutes_outside_8_35' END
         ), '') AS wr
     FROM checked
 )
