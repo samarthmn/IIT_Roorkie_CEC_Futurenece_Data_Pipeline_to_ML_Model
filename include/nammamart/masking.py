@@ -13,7 +13,7 @@ EMAIL_RE = re.compile(config.EMAIL_REGEX)
 
 
 def mask_email(value):
-    """priya.hegde199@example.com -> pr***@example.com. Invalid emails are never echoed back."""
+    """jane.doe@example.com -> ja***@example.com (example value, not a customer). Invalid emails are never echoed back."""
     s = (value or "").strip().lower()
     if not EMAIL_RE.match(s):
         return None
@@ -22,7 +22,7 @@ def mask_email(value):
 
 
 def mask_phone(value):
-    """9774349021 -> 97******21. Fewer than 4 digits -> None."""
+    """9876543210 -> 98******10 (example value). Fewer than 4 digits -> None."""
     digits = re.sub(r"\D", "", value or "")
     if len(digits) < 4:
         return None

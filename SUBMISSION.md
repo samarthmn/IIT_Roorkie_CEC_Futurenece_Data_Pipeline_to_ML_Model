@@ -2,7 +2,21 @@
 
 ## 1. Executive summary
 
-_To be completed after both pipelines and the experiments have run._
+Two Airflow 3 pipelines replace NammaMart's manual morning report. Both are scheduled at 09:00 IST, Monday to Saturday, and both ran green end to end:
+
+- **`nammamart_etl_samarth`**: extract → validate and quarantine in pandas → transform → load a DuckDB star schema.
+- **`nammamart_elt_samarth`**: extract → load every row unchanged into `raw_*` → transform with SQL into `stg_*` and `mart_*`.
+
+Headline results on the September files:
+
+- **Data problems in every file.** 5,212 rows were read and 151 set aside with a reason (orders 104, payments 29, products 10, customers 8). 42 issue types are logged in Part 0.
+- **The two pipelines agree to the paisa:** 2,308 valid orders, net revenue **₹11,34,962.80**, gross margin **₹2,60,826.90**, and 184 payment mismatches worth **₹1,33,277.55** that don't reconcile. They were compared row by row, not just by totals.
+- **The 1 October increment** inserted 150 orders and updated 10 returns, with no duplicates, in both pipelines.
+- **Every run is recorded:** 41 quality checks covering all six dimensions go to `dq_results`, and one row per run (including failures) goes to `pipeline_runs`.
+- **Personal data:** email and phone are masked in every reporting table.
+- **All 10 observability experiments** were run on both pipelines (section 10).
+
+**Recommendation:** ELT, with finance-grade gates in staging (Part G).
 
 ## 2. How to run
 
@@ -28,6 +42,8 @@ astro dev run dags trigger nammamart_etl_samarth --conf '{"as_of_date": "2026-10
 | `data_dir` | `include/data/nammamart` | Input folder relative to `AIRFLOW_HOME`; must be under `include/data` (experiments point it at a generated fixture folder) |
 | `as_of_date` | none (logical date) | Freshness reference, `YYYY-MM-DD`, taken as 09:00 IST that day |
 
+Experiments (Part F): `python3 include/nammamart/make_experiment_fixtures.py` builds one input folder per experiment under `include/data/nammamart_experiments/` (gitignored). Then trigger with `{"data_dir": "include/data/nammamart_experiments/<experiment>", "as_of_date": "2026-10-01"}`.
+
 - Input folder: `include/data/nammamart/` (the five base files). The 1 October increment is added in Experiment 3 by copying `assignment/nammamart_dataset/orders_2026-10-01_increment.csv` into that folder.
 - Warehouse: `include/warehouse_samarth.duckdb` (gitignored). All warehouse timestamps are IST.
 - Quarantine files: `include/quarantine/samarth/` (gitignored: they hold raw rows, including customer PII).
@@ -50,7 +66,7 @@ These decisions apply identically in the ETL (pandas) and ELT (SQL) pipelines so
 | D4 | Duplicate keys | Keep one canonical row (first occurrence in file order) and quarantine only the extra copies as `duplicate_<key>`. For customers, prefer the copy whose email and phone are valid, then the first occurrence. Profiling confirms the first product copy is the right one: orders for P0030 and P0140 are priced at the first copy's `mrp`. |
 | D5 | Fixable values | Trim, case-fold and documented aliases are standardisation, not rejection: `delivered` → `DELIVERED`; `upi`, `UPI ` → `UPI`; `CARD` → `Card`; `cod` → `Cash on Delivery`; `BRONZE`/`bronze`/`SILVER` → `Bronze`/`Silver`. Each mapping is logged as a Warning check. |
 | D6 | Ambiguous values | `Pending??` (status) and `Cashh` (payment mode) are not guessed. They are quarantined as Critical validity failures and raised as client questions. |
-| D7 | Dirty master rows | An order is consistent if its `customer_id`, `product_id` and `store_id` exist in the source master file. A master row that fails its own checks is quarantined from its dimension, but its orders still load, using that source row's attributes (category, cost, zone, tier). S07's blank zone is a Warning: the store is kept with zone `Unknown`. |
+| D7 | Dirty master rows | An order is consistent if its `customer_id`, `product_id` and `store_id` exist in the source master file. A master row that fails its own checks is written to quarantine and flagged `dq_status = 'FAIL'` in its dimension, but it stays there so its orders still join and load (category, cost, zone and tier come from that row). A blank category is shown as `Unknown`. S07's blank zone is a Warning: the store is kept with zone `Unknown`. |
 | D8 | Timestamps | Strict format `YYYY-MM-DD HH:MM:SS` in both pandas and DuckDB; dates `YYYY-MM-DD`. Source timestamps are naive and treated as IST. `order_date` is the IST calendar date. |
 | D9 | Future / out-of-period | Two checks. `future_*` (Timeliness, Critical): later than the run's wall-clock time in IST. `outside_expected_period` (Validity, Critical): `orders.csv` rows outside 1–30 Sept 2026, or increment rows after the date in the file name. The second check keeps results identical whatever day the DAG runs. |
 | D10 | Freshness reference | Stale (Warning) = latest valid `order_ts` more than 24 h before the reference time. Reference = DAG param `as_of_date` when given, else the run's logical date in IST. |
@@ -340,11 +356,448 @@ default_args={"retries": 2, "retry_delay": timedelta(minutes=2), "execution_time
 - **Retries:** 2 retries, 2 minutes apart, cover transient problems such as a file still being copied or a locked warehouse, and still finish well before the 09:30 stand-up. A schema change raises `AirflowFailException`, which skips retries, because retrying cannot fix it.
 - **`execution_timeout` / `dagrun_timeout`:** a hung task or run fails visibly instead of silently blocking the morning report. Airflow 3 has no task SLA, so the 25-minute run timeout is the guard that the report is either ready or visibly failed by about 09:25.
 
-_Answers to the four Part C questions, verified in the UI, follow in Milestone 5._
+### Answers
+
+| Question | Answer (checked in the Airflow 3.3 UI and API) |
+|---|---|
+| What is your cron expression? | `0 9 * * 1-6`: minute 0, hour 9, Monday–Saturday. It is evaluated in `Asia/Kolkata` because `start_date` is IST-aware. The UI describes it as "At 09:00, Monday through Saturday". |
+| What time does the run show in UTC in the Airflow UI? | **03:30 UTC** (IST = UTC+05:30, same day). With the UI timezone set to +05:30 the next run shows `2026-10-22 09:00:00`; switched to UTC it shows `2026-10-22 03:30:00` (screenshots 03 and 04). Scheduled runs are named `scheduled__2026-10-21T03:30:00+00:00`. In Airflow 3 the logical date is the trigger time itself (09:00 IST), not the start of the previous interval as in Airflow 2. |
+| What would happen at 9 AM if you had left `start_date` in UTC? | The cron would be read in UTC, so the run would fire at 09:00 UTC = **14:30 IST**, five hours after the 09:30 stand-up. Keeping UTC would need `30 3 * * 1-6` instead. |
+| What happens if your laptop or Docker is off at 9 AM? | No scheduler, so no run, and nothing tells Kavya the numbers are missing (there is no failure to alert on). When Airflow comes back, `catchup=False` means it does **not** backfill every missed day, but it does create the **most recent** missed run straight away: observed when both DAGs were unpaused at about 17:47 IST on 21 Oct, Airflow immediately ran that day's 09:00 slot (`scheduled__2026-10-21T03:30:00+00:00`). The report would then arrive hours late. Production fix: always-on Airflow (managed service or a server) and an alert when the 09:00 run has *not* succeeded by 09:25. |
+
+Two more points worth stating:
+
+- "Data ready **before** 9:00" and "scheduled **at** 9:00" conflict. The assignment asks for a 09:00 schedule, so that is what is built; both pipelines finish in under 10 seconds, well before the 09:30 stand-up. A true "ready before 9:00" SLA would need an earlier start (for example 08:30) and a completion check.
+- Both DAGs fire at 09:00. Their warehouse tasks share the one-slot `duckdb_samarth` pool, so one waits a few seconds for the other instead of failing on DuckDB's file lock.
 
 ## 9. Business questions
 
-_Milestone 5._
+Each answer is one query on the final tables, run on the September files (`as_of_date = 2026-10-01`), from both pipelines. Results are pasted as returned.
+
+### Q1. Daily net revenue by zone and by store (delivered orders only, after discount)
+
+Grain: day × store, with its zone. September totals by zone follow.
+
+**ETL**
+
+```sql
+SELECT f.order_date, s.zone, f.store_id, s.store_name, SUM(f.net_revenue) AS net_revenue
+FROM etl_fact_orders f JOIN etl_dim_store s USING (store_id)
+WHERE f.order_status = 'DELIVERED'
+GROUP BY ALL ORDER BY f.order_date, s.zone, f.store_id;
+```
+
+| order_date | zone | store_id | store_name | net_revenue |
+|---|---|---|---|---:|
+| 2026-09-01 | East | S08 | NammaMart Whitefield | 2,984.70 |
+| 2026-09-01 | East | S09 | NammaMart Indiranagar | 2,945.40 |
+| 2026-09-01 | East | S10 | NammaMart Marathahalli | 2,141.60 |
+| 2026-09-01 | East | S11 | NammaMart HSR Layout | 2,121.15 |
+| 2026-09-01 | North | S01 | NammaMart Hebbal | 2,247.80 |
+| 2026-09-01 | North | S02 | NammaMart Yelahanka | 2,385.55 |
+| 2026-09-01 | North | S03 | NammaMart RT Nagar | 4,583.80 |
+| 2026-09-01 | South | S04 | NammaMart Jayanagar | 1,103.30 |
+
+_445 rows; first 8 shown._
+
+**ELT**
+
+```sql
+SELECT order_date, zone, store_id, store_name, net_revenue
+FROM mart_daily_store_kpis
+WHERE delivered_orders > 0
+ORDER BY order_date, zone, store_id;
+```
+
+| order_date | zone | store_id | store_name | net_revenue |
+|---|---|---|---|---:|
+| 2026-09-01 | East | S08 | NammaMart Whitefield | 2,984.70 |
+| 2026-09-01 | East | S09 | NammaMart Indiranagar | 2,945.40 |
+| 2026-09-01 | East | S10 | NammaMart Marathahalli | 2,141.60 |
+| 2026-09-01 | East | S11 | NammaMart HSR Layout | 2,121.15 |
+| 2026-09-01 | North | S01 | NammaMart Hebbal | 2,247.80 |
+| 2026-09-01 | North | S02 | NammaMart Yelahanka | 2,385.55 |
+| 2026-09-01 | North | S03 | NammaMart RT Nagar | 4,583.80 |
+| 2026-09-01 | South | S04 | NammaMart Jayanagar | 1,103.30 |
+
+_445 rows; first 8 shown._
+
+**ETL, September by zone**
+
+```sql
+SELECT s.zone, SUM(f.net_revenue) AS net_revenue
+FROM etl_fact_orders f JOIN etl_dim_store s USING (store_id)
+WHERE f.order_status = 'DELIVERED' GROUP BY 1 ORDER BY 1;
+```
+
+| zone | net_revenue |
+|---|---:|
+| East | 291,804.25 |
+| North | 226,807.50 |
+| South | 241,228.80 |
+| Unknown | 82,725.60 |
+| West | 292,396.65 |
+
+**ELT, September by zone**
+
+```sql
+SELECT zone, SUM(net_revenue) AS net_revenue FROM mart_daily_store_kpis GROUP BY 1 ORDER BY 1;
+```
+
+| zone | net_revenue |
+|---|---:|
+| East | 291,804.25 |
+| North | 226,807.50 |
+| South | 241,228.80 |
+| Unknown | 82,725.60 |
+| West | 292,396.65 |
+
+**Match:** yes, all 445 day × store rows and every zone total; September net revenue ₹11,34,962.80 in both. S07's zone is blank in the store master, so it is reported as `Unknown` (client question 2).
+
+### Q2. Revenue and gross margin by product category (margin = revenue − quantity × cost_price)
+
+**ETL**
+
+```sql
+SELECT p.category, SUM(f.net_revenue) AS revenue,
+       SUM(f.net_revenue - f.quantity * p.cost_price) AS gross_margin
+FROM etl_fact_orders f JOIN etl_dim_product p USING (product_id)
+WHERE f.order_status = 'DELIVERED'
+GROUP BY 1 ORDER BY revenue DESC;
+```
+
+| category | revenue | gross_margin |
+|---|---:|---:|
+| Staples | 266,500.90 | 58,728.22 |
+| Personal Care | 205,016.80 | 44,444.98 |
+| Household | 199,321.45 | 51,031.69 |
+| Dairy & Bakery | 169,528.75 | 44,791.84 |
+| Snacks & Beverages | 161,598.95 | 37,665.60 |
+| Fruits & Vegetables | 93,284.30 | 19,600.62 |
+| Unknown | 39,711.65 | 4,563.95 |
+
+**ELT**
+
+```sql
+SELECT category, revenue, gross_margin FROM mart_category_margin ORDER BY revenue DESC;
+```
+
+| category | revenue | gross_margin |
+|---|---:|---:|
+| Staples | 266,500.90 | 58,728.22 |
+| Personal Care | 205,016.80 | 44,444.98 |
+| Household | 199,321.45 | 51,031.69 |
+| Dairy & Bakery | 169,528.75 | 44,791.84 |
+| Snacks & Beverages | 161,598.95 | 37,665.60 |
+| Fruits & Vegetables | 93,284.30 | 19,600.62 |
+| Unknown | 39,711.65 | 4,563.95 |
+
+**Match:** yes. Total revenue ₹11,34,962.80, gross margin ₹2,60,826.90. `Unknown` = orders of P0051/P0060/P0068, whose category is blank in the catalogue; the orders are valid sales so they are kept (decision D7).
+
+### Q3. Average delivery time per store, and % of delivered orders within 15 minutes
+
+State: September files, before the 1 October increment.
+
+**ETL**
+
+```sql
+SELECT store_id, ROUND(AVG(delivery_minutes), 1) AS avg_delivery_minutes,
+       ROUND(100.0 * AVG(CASE WHEN within_15_min THEN 1 ELSE 0 END), 1) AS pct_within_15_min
+FROM etl_fact_orders WHERE order_status = 'DELIVERED'
+GROUP BY 1 ORDER BY 1;
+```
+
+| store_id | avg_delivery_minutes | pct_within_15_min |
+|---|---:|---:|
+| S01 | 20.70 | 30.90 |
+| S02 | 21.40 | 28.40 |
+| S03 | 20.60 | 30.40 |
+| S04 | 21.40 | 27.10 |
+| S05 | 21.50 | 30.00 |
+| S06 | 22.50 | 22.30 |
+| S07 | 21.30 | 32.40 |
+| S08 | 20.50 | 36.00 |
+| S09 | 21.30 | 27.10 |
+| S10 | 22.10 | 26.30 |
+| S11 | 21.20 | 28.20 |
+| S12 | 22.40 | 21.90 |
+| S13 | 21.90 | 27.70 |
+| S14 | 21.90 | 30.30 |
+| S15 | 22.30 | 22.00 |
+
+**ELT**
+
+```sql
+SELECT store_id, avg_delivery_minutes, pct_within_15_min FROM mart_delivery_sla ORDER BY store_id;
+```
+
+| store_id | avg_delivery_minutes | pct_within_15_min |
+|---|---:|---:|
+| S01 | 20.70 | 30.90 |
+| S02 | 21.40 | 28.40 |
+| S03 | 20.60 | 30.40 |
+| S04 | 21.40 | 27.10 |
+| S05 | 21.50 | 30.00 |
+| S06 | 22.50 | 22.30 |
+| S07 | 21.30 | 32.40 |
+| S08 | 20.50 | 36.00 |
+| S09 | 21.30 | 27.10 |
+| S10 | 22.10 | 26.30 |
+| S11 | 21.20 | 28.20 |
+| S12 | 22.40 | 21.90 |
+| S13 | 21.90 | 27.70 |
+| S14 | 21.90 | 30.30 |
+| S15 | 22.30 | 22.00 |
+
+**Match:** yes for all 15 stores. Every store averages 20.5–22.5 minutes and only 22–36% of deliveries meet 15 minutes: the "10-minute promise" is not being met anywhere.
+
+### Q4. Revenue by payment mode, and the total amount that doesn't reconcile with the payment gateway
+
+**ETL, revenue by payment mode**
+
+```sql
+SELECT payment_mode, SUM(net_revenue) AS revenue
+FROM etl_fact_orders WHERE order_status = 'DELIVERED'
+GROUP BY 1 ORDER BY revenue DESC;
+```
+
+| payment_mode | revenue |
+|---|---:|
+| UPI | 620,387.85 |
+| Card | 230,913.90 |
+| Cash on Delivery | 160,022.25 |
+| Wallet | 123,638.80 |
+
+**ELT, revenue by payment mode**
+
+```sql
+SELECT payment_mode, SUM(net_revenue) AS revenue
+FROM stg_orders WHERE dq_status <> 'FAIL' AND order_status = 'DELIVERED'
+GROUP BY 1 ORDER BY revenue DESC;
+```
+
+| payment_mode | revenue |
+|---|---:|
+| UPI | 620,387.85 |
+| Card | 230,913.90 |
+| Cash on Delivery | 160,022.25 |
+| Wallet | 123,638.80 |
+
+**ETL, unreconciled amount**
+
+```sql
+SELECT CASE WHEN reason IN ('PAYMENT_NOT_YET_RECEIVED', 'RETURNED_NOT_REFUNDED') THEN 'timing' ELSE 'mismatch' END AS kind,
+       reason, COUNT(*) AS rows, SUM(difference) AS signed_amount, SUM(ABS(difference)) AS unreconciled_amount
+FROM etl_payment_reconciliation
+GROUP BY ROLLUP (1, 2) ORDER BY 1 NULLS LAST, 2 NULLS LAST;
+```
+
+| kind | reason | rows | signed_amount | unreconciled_amount |
+|---|---|---:|---:|---:|
+| mismatch | AMOUNT_MISMATCH | 13 | -760.00 | 760.00 |
+| mismatch | DUPLICATE_PAYMENT_ID | 4 | 1,330.50 | 1,330.50 |
+| mismatch | MISSING_PAYMENT | 27 | -16,664.35 | 16,664.35 |
+| mismatch | ORDER_NOT_FOUND | 8 | 4,580.57 | 4,580.57 |
+| mismatch | ORDER_REJECTED | 90 | 76,307.88 | 84,219.88 |
+| mismatch | PAYMENT_FAILED | 42 | -25,722.25 | 25,722.25 |
+| mismatch |  | 184 | 39,072.35 | 133,277.55 |
+|  |  | 184 | 39,072.35 | 133,277.55 |
+
+**ELT, unreconciled amount**
+
+```sql
+SELECT CASE WHEN reason IN ('PAYMENT_NOT_YET_RECEIVED', 'RETURNED_NOT_REFUNDED') THEN 'timing' ELSE 'mismatch' END AS kind,
+       reason, COUNT(*) AS rows, SUM(difference) AS signed_amount, SUM(ABS(difference)) AS unreconciled_amount
+FROM mart_payment_reconciliation
+GROUP BY ROLLUP (1, 2) ORDER BY 1 NULLS LAST, 2 NULLS LAST;
+```
+
+| kind | reason | rows | signed_amount | unreconciled_amount |
+|---|---|---:|---:|---:|
+| mismatch | AMOUNT_MISMATCH | 13 | -760.00 | 760.00 |
+| mismatch | DUPLICATE_PAYMENT_ID | 4 | 1,330.50 | 1,330.50 |
+| mismatch | MISSING_PAYMENT | 27 | -16,664.35 | 16,664.35 |
+| mismatch | ORDER_NOT_FOUND | 8 | 4,580.57 | 4,580.57 |
+| mismatch | ORDER_REJECTED | 90 | 76,307.88 | 84,219.88 |
+| mismatch | PAYMENT_FAILED | 42 | -25,722.25 | 25,722.25 |
+| mismatch |  | 184 | 39,072.35 | 133,277.55 |
+|  |  | 184 | 39,072.35 | 133,277.55 |
+
+**Match:** yes, mode by mode and reason by reason.
+
+**Answer:** **₹1,33,277.55** doesn't reconcile (sum of absolute differences over 184 rows; signed net +₹39,072.35). The absolute sum is the right measure for finance, because overpayments and missing payments don't cancel each other out in an investigation. The largest part (₹84,219.88) is money collected for orders the pipeline rejected, for example `Pending??` orders that were paid. Timing reasons (`PAYMENT_NOT_YET_RECEIVED`, `RETURNED_NOT_REFUNDED`) are reported separately as `timing`; there are none in the September-only state. After the 1 October increment they add 150 + 10 rows (Experiment 3).
+
+### Q5. Top 10 customers by spend, with loyalty tier (no raw email or phone)
+
+**ETL**
+
+```sql
+SELECT f.customer_id, c.email_masked, c.loyalty_tier, SUM(f.net_revenue) AS spend
+FROM etl_fact_orders f JOIN etl_dim_customer c USING (customer_id)
+WHERE f.order_status = 'DELIVERED'
+GROUP BY ALL ORDER BY spend DESC, f.customer_id LIMIT 10;
+```
+
+| customer_id | email_masked | loyalty_tier | spend |
+|---|---|---|---:|
+| C00136 | sa***@example.com | Bronze | 8,738.10 |
+| C00283 | ni***@example.com | Bronze | 7,934.60 |
+| C00071 | ma***@example.com | Silver | 7,349.30 |
+| C00310 |  | Bronze | 7,258.95 |
+| C00236 | sn***@example.com | Platinum | 7,016.40 |
+| C00338 | bh***@example.com | Silver | 6,848.55 |
+| C00209 | ka***@example.com | Platinum | 6,519.40 |
+| C00115 | sa***@example.com | Bronze | 6,483.70 |
+| C00036 | de***@example.com | Bronze | 6,466.50 |
+| C00072 | na***@example.com | Silver | 6,433.95 |
+
+**ELT**
+
+```sql
+SELECT spend_rank, customer_id, email_masked, loyalty_tier, spend
+FROM mart_top_customers WHERE spend_rank <= 10 ORDER BY spend_rank;
+```
+
+| spend_rank | customer_id | email_masked | loyalty_tier | spend |
+|---:|---|---|---|---:|
+| 1 | C00136 | sa***@example.com | Bronze | 8,738.10 |
+| 2 | C00283 | ni***@example.com | Bronze | 7,934.60 |
+| 3 | C00071 | ma***@example.com | Silver | 7,349.30 |
+| 4 | C00310 |  | Bronze | 7,258.95 |
+| 5 | C00236 | sn***@example.com | Platinum | 7,016.40 |
+| 6 | C00338 | bh***@example.com | Silver | 6,848.55 |
+| 7 | C00209 | ka***@example.com | Platinum | 6,519.40 |
+| 8 | C00115 | sa***@example.com | Bronze | 6,483.70 |
+| 9 | C00036 | de***@example.com | Bronze | 6,466.50 |
+| 10 | C00072 | na***@example.com | Silver | 6,433.95 |
+
+**Match:** yes. Only the masked email is shown; C00310's email is invalid in the CRM, so its masked value is empty rather than echoing a bad address.
+
+### Q6. Number of rows rejected today, by file and by reason
+
+"Today" = the latest successful run of the day (IST). A row can break several rules, so reason counts add up to more than the row count; the per-file row totals follow.
+
+**ETL (`etl_rejected_rows`, written by the load from the quarantine files)**
+
+```sql
+WITH todays_run AS (            -- latest successful ETL run started today (IST)
+    SELECT run_id FROM pipeline_runs
+    WHERE dag_id = 'nammamart_etl_samarth' AND status <> 'FAILED'
+      AND CAST(start_time AS DATE) = CAST(now() AT TIME ZONE 'Asia/Kolkata' AS DATE)
+    ORDER BY start_time DESC LIMIT 1)
+SELECT file_name, reason, COUNT(*) AS rows_rejected
+FROM (SELECT file_name, UNNEST(string_split(failure_reason, ';')) AS reason
+      FROM etl_rejected_rows WHERE run_id = (SELECT run_id FROM todays_run))
+GROUP BY ALL ORDER BY file_name, rows_rejected DESC, reason;
+```
+
+| file_name | reason | rows_rejected |
+|---|---|---:|
+| customers.csv | duplicate_customer_id | 5 |
+| customers.csv | future_signup_date | 3 |
+| orders.csv | missing_customer_id | 18 |
+| orders.csv | order_amount_mismatch | 18 |
+| orders.csv | duplicate_order_id | 12 |
+| orders.csv | nonpositive_quantity | 10 |
+| orders.csv | unknown_product_id | 9 |
+| orders.csv | delivered_missing_delivery_minutes | 8 |
+| orders.csv | outside_expected_period | 7 |
+| orders.csv | delivery_minutes_over_120 | 6 |
+| orders.csv | future_order_ts | 5 |
+| orders.csv | invalid_order_ts | 5 |
+| orders.csv | unknown_store_id | 5 |
+| orders.csv | invalid_discount_pct | 3 |
+| orders.csv | invalid_order_status | 3 |
+| orders.csv | invalid_payment_mode | 2 |
+| orders.csv | missing_order_ts | 1 |
+| payments.csv | nonpositive_amount_paid | 10 |
+| payments.csv | unknown_order_id | 8 |
+| payments.csv | future_payment_ts | 5 |
+| payments.csv | duplicate_payment_id | 4 |
+| payments.csv | invalid_payment_mode | 2 |
+| products.csv | cost_above_mrp | 5 |
+| products.csv | missing_category | 3 |
+| products.csv | duplicate_product_id | 2 |
+| products.csv | nonpositive_mrp | 1 |
+
+**ELT (`stg_*` rows with `dq_status = 'FAIL'` + `stg_rejected_duplicates`)**
+
+```sql
+SELECT file_name, reason, COUNT(*) AS rows_rejected
+FROM (SELECT 'orders' AS file_name, UNNEST(string_split(failure_reason, ';')) AS reason FROM stg_orders WHERE dq_status = 'FAIL'
+      UNION ALL SELECT 'payments', UNNEST(string_split(failure_reason, ';')) FROM stg_payments WHERE dq_status = 'FAIL'
+      UNION ALL SELECT 'customers', UNNEST(string_split(failure_reason, ';')) FROM stg_customers WHERE dq_status = 'FAIL'
+      UNION ALL SELECT 'products', UNNEST(string_split(failure_reason, ';')) FROM stg_products WHERE dq_status = 'FAIL'
+      UNION ALL SELECT 'stores', UNNEST(string_split(failure_reason, ';')) FROM stg_stores WHERE dq_status = 'FAIL'
+      UNION ALL SELECT replace(replace(file_name, '.csv', ''), '_2026-10-01_increment', '_increment'), failure_reason
+                FROM stg_rejected_duplicates)
+GROUP BY ALL ORDER BY file_name, rows_rejected DESC, reason;
+```
+
+| file_name | reason | rows_rejected |
+|---|---|---:|
+| customers | duplicate_customer_id | 5 |
+| customers | future_signup_date | 3 |
+| orders | missing_customer_id | 18 |
+| orders | order_amount_mismatch | 18 |
+| orders | duplicate_order_id | 12 |
+| orders | nonpositive_quantity | 10 |
+| orders | unknown_product_id | 9 |
+| orders | delivered_missing_delivery_minutes | 8 |
+| orders | outside_expected_period | 7 |
+| orders | delivery_minutes_over_120 | 6 |
+| orders | future_order_ts | 5 |
+| orders | invalid_order_ts | 5 |
+| orders | unknown_store_id | 5 |
+| orders | invalid_discount_pct | 3 |
+| orders | invalid_order_status | 3 |
+| orders | invalid_payment_mode | 2 |
+| orders | missing_order_ts | 1 |
+| payments | nonpositive_amount_paid | 10 |
+| payments | unknown_order_id | 8 |
+| payments | future_payment_ts | 5 |
+| payments | duplicate_payment_id | 4 |
+| payments | invalid_payment_mode | 2 |
+| products | cost_above_mrp | 5 |
+| products | missing_category | 3 |
+| products | duplicate_product_id | 2 |
+| products | nonpositive_mrp | 1 |
+
+**ETL, rows per file**
+
+```sql
+SELECT file_name, COUNT(*) AS rows_rejected FROM etl_rejected_rows
+WHERE run_id = (SELECT run_id FROM pipeline_runs WHERE dag_id = 'nammamart_etl_samarth' AND status <> 'FAILED'
+                ORDER BY start_time DESC LIMIT 1)
+GROUP BY 1 ORDER BY 1;
+```
+
+| file_name | rows_rejected |
+|---|---:|
+| customers.csv | 8 |
+| orders.csv | 104 |
+| payments.csv | 29 |
+| products.csv | 10 |
+
+**ELT, rows per file**
+
+```sql
+SELECT 'orders' AS file, COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT COUNT(*) FROM stg_rejected_duplicates WHERE file_name LIKE 'orders%') AS rows_rejected FROM stg_orders
+UNION ALL SELECT 'payments', COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT COUNT(*) FROM stg_rejected_duplicates WHERE file_name = 'payments.csv') FROM stg_payments
+UNION ALL SELECT 'customers', COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT COUNT(*) FROM stg_rejected_duplicates WHERE file_name = 'customers.csv') FROM stg_customers
+UNION ALL SELECT 'products', COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT COUNT(*) FROM stg_rejected_duplicates WHERE file_name = 'products.csv') FROM stg_products
+UNION ALL SELECT 'stores', COUNT(*) FILTER (WHERE dq_status = 'FAIL') + (SELECT COUNT(*) FROM stg_rejected_duplicates WHERE file_name = 'stores.csv') FROM stg_stores;
+```
+
+| file | rows_rejected |
+|---|---:|
+| orders | 104 |
+| payments | 29 |
+| customers | 8 |
+| products | 10 |
+| stores | 0 |
+
+**Match:** yes, reason by reason: 151 rows rejected (orders 104, payments 29, products 10, customers 8, stores 0).
 
 ## 10. Part F: Observability tests
 
@@ -412,12 +865,257 @@ Task code cannot query Airflow's metadata database in Airflow 3, so the audit ta
 
 ## 11. Part E: Data governance
 
-_Milestone 5._
+### 1. Ownership
+
+| Dataset | Owner (accountable for correctness) |
+|---|---|
+| orders (OMS export) | Operations: the order management system owner |
+| payments (gateway export) | Finance |
+| customers (CRM) | CRM / marketing; the Data Protection Officer owns how its personal data is used |
+| products (catalogue) | Category / catalogue team |
+| stores (store master) | Operations / expansion |
+| warehouse tables (`raw_*`, `stg_*`, `mart_*`, `etl_*`, `dq_results`, `pipeline_runs`) | The data team (the FDE today) |
+
+A change to a quality rule, such as the 120-minute delivery limit, is **proposed** by the data team and **approved** by the business owner of that data: Operations for delivery rules, Finance for money and reconciliation rules. The change is made once in `include/nammamart/config.py` and the matching `.sql` file, reviewed and committed to git, so the rule history is auditable.
+
+### 2. Data dictionary
+
+**`etl_fact_orders`**: one row per valid order (the ELT equivalent is `stg_orders WHERE dq_status <> 'FAIL'`).
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| order_id | VARCHAR (key) | Order identifier | orders.order_id (or increment) | `ORD` + 6 digits, unique | No |
+| order_ts | TIMESTAMP | When the order was placed, IST | orders.order_ts | 1–30 Sept 2026 (increment: ≤ file date), not in the future | No |
+| order_date | DATE | Calendar day of `order_ts` (IST) | derived | — | No |
+| customer_id | VARCHAR | Customer key → `etl_dim_customer` | orders.customer_id | exists in customers.csv | Pseudonymous identifier |
+| store_id | VARCHAR | Store key → `etl_dim_store` | orders.store_id | exists in stores.csv | No |
+| product_id | VARCHAR | Product key → `etl_dim_product` | orders.product_id | exists in products.csv | No |
+| quantity | INTEGER | Units ordered | orders.quantity | integer > 0 | No |
+| unit_price | DECIMAL(12,2) | Price per unit, ₹ | orders.unit_price | > 0 | No |
+| discount_pct | DECIMAL(5,2) | Discount, % | orders.discount_pct | 0–100 | No |
+| order_amount | DECIMAL(12,2) | Amount after discount, ₹ | orders.order_amount | = round(quantity × unit_price × (1 − discount_pct/100), 2) ± 0.01 | No |
+| payment_mode | VARCHAR | Standardised payment mode | orders.payment_mode | UPI, Card, Cash on Delivery, Wallet | No |
+| order_status | VARCHAR | Current status (after increments) | orders.order_status | DELIVERED, CANCELLED, RETURNED | No |
+| channel | VARCHAR | Ordering channel | orders.channel | App, Web | No |
+| delivery_minutes | INTEGER | Minutes from order to delivery | orders.delivery_minutes | required if DELIVERED; ≤ 120 | No |
+| net_revenue | DECIMAL(12,2) | Revenue counted: `order_amount` if DELIVERED, else 0 | derived | ≥ 0 | No |
+| gross_margin | DECIMAL(12,2) | `net_revenue − quantity × cost_price` if DELIVERED, else 0 | derived (with products.cost_price) | — | No |
+| within_15_min | BOOLEAN | DELIVERED and `delivery_minutes ≤ 15` | derived | — | No |
+| source_file, source_row, run_id, loaded_at | VARCHAR / INTEGER / VARCHAR / TIMESTAMP | Lineage: file, data line, Airflow run, load time | pipeline | — | No |
+
+**`etl_dim_customer`** (ELT: `stg_customers`)
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| customer_id | VARCHAR (key) | Customer identifier | customers.customer_id | one row per id | Pseudonymous identifier |
+| email_masked | VARCHAR | First 2 characters + `***@` + domain; NULL if the email is invalid | customers.email | e.g. `pr***@example.com` | Masked PII |
+| phone_masked | VARCHAR | First 2 + `*` × (n−4) + last 2 digits | customers.phone | e.g. `98******21` | Masked PII |
+| city, area | VARCHAR | Location | customers.city, area | — | Personal data (coarse location) |
+| loyalty_tier | VARCHAR | Standardised tier | customers.loyalty_tier | Bronze, Silver, Gold, Platinum | No |
+| signup_date | DATE | Sign-up date | customers.signup_date | not in the future | Personal data |
+| is_active | BOOLEAN | Active customer | customers.is_active | Y → true | No |
+| dq_status, failure_reason, warning_reason | VARCHAR | Result of the customer checks | pipeline | PASS / WARN / FAIL | No |
+
+`full_name`, clear `email`, clear `phone` and `pincode` are not loaded into any reporting table.
+
+**`etl_dim_product`** (ELT: `stg_products`)
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| product_id | VARCHAR (key) | Product identifier | products.product_id | one row per id (first copy) | No |
+| product_name, sub_category, brand, unit | VARCHAR | Descriptive attributes | products | — | No |
+| category | VARCHAR | Category; blank → `Unknown` | products.category | 6 categories or Unknown | No |
+| mrp | DECIMAL(12,2) | Maximum retail price, ₹ | products.mrp | > 0 | No |
+| cost_price | DECIMAL(12,2) | Cost to NammaMart, ₹ | products.cost_price | ≤ mrp | No |
+| is_perishable | BOOLEAN | Perishable item | products.is_perishable | — | No |
+| launch_date | DATE | Launch date | products.launch_date | — | No |
+| dq_status, failure_reason, warning_reason | VARCHAR | Product check results (FAIL rows stay so their orders join) | pipeline | PASS / WARN / FAIL | No |
+
+**`etl_dim_store`** (ELT: `stg_stores`)
+
+| Column | Type | Meaning | Source | Allowed values | PII |
+|---|---|---|---|---|---|
+| store_id | VARCHAR (key) | Dark store identifier | stores.store_id | S01–S15 | No |
+| store_name, area | VARCHAR | Name and locality | stores | — | No |
+| zone | VARCHAR | Zone; blank → `Unknown` | stores.zone | North, South, East, West, Unknown | No |
+| pincode | VARCHAR | Store pincode | stores.pincode | 6 digits | No (business address) |
+| open_date | DATE | Opening date | stores.open_date | — | No |
+| capacity_orders_per_day | INTEGER | Planned daily capacity | stores.capacity_orders_per_day | > 0 expected (S12 = 0, logged) | No |
+| dq_status, failure_reason, warning_reason | VARCHAR | Store check results | pipeline | PASS / WARN / FAIL | No |
+
+`manager_name` (employee personal data) is not loaded.
+
+### 3. Lineage
+
+Traced number: **`mart_daily_store_kpis` for 14 Sept 2026, store S05 (JP Nagar, South) = 5 delivered orders, ₹1,649.50.**
+
+| Step | ELT | ETL |
+|---|---|---|
+| Report cell | `mart_daily_store_kpis` (2026-09-14, S05) = ₹1,649.50 | `etl_daily_zone_revenue` (2026-09-14, S05) = ₹1,649.50 |
+| Rows behind it | `stg_orders`: ORD001065 ₹251.10, ORD001060 ₹395.00, ORD001041 ₹684.00, ORD001083 ₹93.00, ORD001052 ₹226.40 (all PASS) | `etl_fact_orders`: same 5 orders, with `source_file = orders.csv`, `source_row` 594, 836, 1697, 1712, 1877 |
+| Exact source rows | Join on `_run_id` + `_source_file` + `_source_row` to `raw_orders`: the rows exactly as received, with `_loaded_at` | Not in the warehouse: open `orders.csv` at those lines |
+| File lines | `orders.csv` lines 595, 837, 1698, 1713, 1878 (line = `_source_row` + 1 for the header) | Same |
+
+Both can do it because both carry `source_file` / `source_row` / `run_id`. **ELT is easier**: the whole chain is SQL joins inside the warehouse, and `raw_orders` shows the row exactly as it arrived in *that* run, even if the file was overwritten later. In the ETL the last step needs the original CSV, and only the current run's version of the fact exists.
+
+### 4. Personal data
+
+Personal data in the dataset:
+
+- customers: `full_name`, `email`, `phone`, `area` + `pincode` (location), `signup_date`, and `customer_id` (pseudonymous, but it links everything about one person)
+- stores: `manager_name` (employee data)
+- payments: `gateway_ref` (a payment reference that can be linked back to a person by the gateway)
+
+How it is handled:
+
+- **Masked:** `email` and `phone`, by the same rule in Python (`masking.py`) and SQL (`23_stg_customers.sql`). Invalid emails become NULL rather than being echoed back.
+- **Not loaded at all** into any reporting table: `full_name`, `pincode`, `manager_name`.
+- **Clear values exist only** in `include/data/` (source files), `raw_customers` and the quarantine files.
+
+**Why mask rather than delete:** analysts still need to tell customers apart (top-customer ranking, duplicate detection, support look-ups by partial email), and finance needs to answer "whose order was this?" without seeing the full contact details. Masking keeps that usefulness while removing the ability to contact or identify the person from the report (data minimisation).
+
+**Law:** the **Digital Personal Data Protection Act, 2023 (DPDP Act)**, with the **DPDP Rules, 2025**, notified in November 2025 with a phased start (most obligations apply after a transition period; confirm the current effective dates with legal before relying on them). It expects:
+
+- processing for a lawful purpose, with a clear notice and consent
+- collecting only what is needed (data minimisation) and keeping it accurate
+- reasonable security safeguards against breaches
+- reporting personal-data breaches to the Data Protection Board and to the affected people
+- honouring people's rights to access, correct and erase their data, with a way to raise grievances
+- erasing data once the purpose is served
+
+### 5. Access control
+
+| Layer | Who should read it |
+|---|---|
+| `raw_*` and quarantine files | Data engineers only, plus an audited "break-glass" role for investigations: they hold clear PII |
+| `stg_*` | Data engineers and analysts (PII already masked) |
+| `mart_*`, `etl_*` reporting tables | Business users: COO, store managers, finance |
+| `dq_results`, `pipeline_runs` | Everyone who relies on the numbers |
+
+Unmasked `customers.phone` in raw: ideally **nobody** reads it from the warehouse. The delivery and support teams that need a phone number should get it from the CRM, which is built for that and logs access. DuckDB has no per-table permissions, so in this setup separation would need OS file permissions on the database file, or moving raw and quarantine to a separate restricted file. In production: a warehouse with roles (for example PostgreSQL, BigQuery, Snowflake) and column-level masking policies.
+
+### 6. Retention (proposed; to be confirmed with legal and finance)
+
+| Data | Keep for | Then |
+|---|---|---|
+| Raw orders and payments | ~8 years: they are financial records (the Companies Act, 2013 requires books of account for 8 years) | Archive to cold storage, then delete |
+| Quarantine files | ~90 days after the issue is resolved | Delete |
+| Raw customer PII (`raw_customers`, source CRM extracts) | While the customer account is active + a short grace period | Erase or anonymise (DPDP: erase when the purpose is served) |
+| Masked analytical tables | Longer (multi-year trends), as long as they can't re-identify anyone | Re-check that masking still holds before extending |
+| `dq_results`, `pipeline_runs` | 1–2 years (trend and audit history) | Delete |
+
+### 7. Secrets
+
+The assignment's example is `SLACK_WEBHOOK_URL`. In this project:
+
+- **Where it is read:** the trainer's `meridian_pipeline` reads it with `Variable.get("SLACK_WEBHOOK_URL")`. My two DAGs don't use any secret.
+- **Where a real value would live:** an Airflow Variable (Admin → Variables), or `.env` as `AIRFLOW_VAR_SLACK_WEBHOOK_URL`. `.env` is gitignored; only `.env.example`, with empty values, is committed. In production: a secrets backend such as AWS Secrets Manager or Vault.
+- **Why never in a DAG file or on GitHub:** a webhook URL *is* a credential, so anyone who has it can post to the channel. Git history is permanent and copied to every clone and fork, so a leaked secret has to be rotated, not just deleted. DAG code is also visible to everyone with UI access.
+
+### 8. Audit: "show a rejected order exactly as received, the rule it broke, and prove it isn't in the CFO's total"
+
+Order **ORD001459** (quantity −3):
+
+- **ELT:**
+  - As received: `SELECT * FROM raw_orders WHERE order_id = 'ORD001459' AND _run_id = '<run>'`. It returns `quantity = '-3'`, `order_amount = '-1593.0'`, `order_status = 'DELIVERED'`, from `orders.csv` row 815 (file line 816).
+  - The rule it broke: `stg_orders` shows `dq_status = 'FAIL'`, `failure_reason = 'nonpositive_quantity'`.
+  - Not in the total: `SUM(net_revenue)` over `stg_orders` PASS/WARN rows = `mart_daily_store_kpis` total = ₹11,34,962.80, which excludes it.
+  - Three queries, one place.
+- **ETL:**
+  - As received: the row is in `include/quarantine/samarth/orders_failed_<run>.csv` with `failure_reason = nonpositive_quantity` and `source_row = 815`.
+  - The rule it broke, from the warehouse: `etl_rejected_rows` has (run, `orders.csv`, ORD001459, `nonpositive_quantity`).
+  - Not in the total: `SELECT COUNT(*) FROM etl_fact_orders WHERE order_id = 'ORD001459'` = 0, and the fact total is ₹11,34,962.80.
+  - The original row is in a file outside the warehouse, so the auditor needs file access too.
+
+### 9. Change history: an order DELIVERED in September and RETURNED on 1 October
+
+Example: ORD000017 (₹16.00) and the other 9 corrections in the increment (₹4,193.70 in total).
+
+- **After the incremental load, both pipelines show the *current-restated* view.** The 10 orders are RETURNED, so September net revenue becomes ₹11,30,769.10 instead of ₹11,34,962.80 (Experiment 3).
+- **ETL:** each run replaces the fact table, so the as-reported September figure (₹11,34,962.80) no longer exists in the warehouse.
+- **ELT:** the figure is still recoverable. Every earlier raw batch keeps ORD000017 as DELIVERED; querying the Experiment 1 batch gives all 10 orders DELIVERED, worth ₹4,193.70, while the Experiment 3 batch has them RETURNED. Re-running the staging SQL on an older `_run_id` reproduces the old figure exactly.
+- **What finance wants:** usually the **closed month frozen** (September as reported to management) and the return **booked in October** as a negative adjustment, so reports never change silently after sign-off.
+- **How to keep both views:**
+  - keep an order-status history (each status with `valid_from` / `valid_to`, the slowly-changing-dimension idea), or
+  - snapshot `mart_daily_store_kpis` at month close, and report returns by *return date*.
+
+  ELT makes either easy because raw keeps every version. I did not build this: it goes beyond the assignment's scope.
 
 ## 12. Part G: Recommendation to Sameer (CTO)
 
-_Milestone 5._
+**To:** Sameer, CTO, NammaMart  **From:** Samarth, Forward Deployed Engineer  **Date:** 21 October 2026
+**Subject:** ETL or ELT for the 9 AM report
+
+**Recommendation: adopt ELT**, with finance-grade gates in staging so that no bad row ever reaches a report.
+
+I built both pipelines on the same five exports and ran them side by side, including ten failure experiments each. The evidence:
+
+- **Data quality guarantee: a tie.** Both produced exactly the same finance numbers: 2,308 valid orders, September net revenue ₹11,34,962.80, gross margin ₹2,60,826.90, the same 151 rows rejected and the same 184 payment mismatches. Comparing row by row found zero differences. ELT gives finance the same "no bad row in the report" guarantee as ETL, because every mart reads only rows that passed every critical check.
+- **Auditability: ELT wins.** When finance asks "show me this rejected order as received, the rule it broke, and prove it's not in the total", ELT answers with three queries in one place. ETL needs the warehouse plus a quarantine file on disk. ELT also traced a report cell (14 Sept, store S05, ₹1,649.50) back to the exact five file lines with SQL alone.
+- **History: ELT wins.** When the 1 October file turned 10 September orders into returns, both pipelines restated September revenue (−₹4,193.70). Only ELT still holds the September figure as originally reported, because raw keeps every day's data. That's what finance needs to freeze a closed month.
+- **Ease of change: ELT is simpler.** A rule change, such as the 120-minute delivery limit, is one line in one SQL file and can be re-run on yesterday's raw data to see its effect before go-live. In ETL the rule lives in Python and the old data has to be re-read from files.
+- **Failure behaviour: a tie.** Both failed loudly and safely on a missing file (retried 3 times, then stopped) and on a renamed column (stopped at once). Neither published bad tables. Both recovered by re-running only the failed step.
+- **Performance today:** about 6 seconds (ETL) and 3–4 seconds (ELT) end to end. Both finish long before 09:30.
+
+**At 1000× the data** (about 2.4 million orders a month and ~5 million rows per daily load):
+
+- Today's design re-reads whole files every day, and ETL holds them in memory in pandas, so ETL would hit memory limits first.
+- DuckDB allows one writer on one machine, and a laptop scheduler won't be reliable.
+- The ELT design scales by changing the platform, not the logic: process only each day's new partition, move raw to object storage with a columnar warehouse, run Airflow as a managed service, and keep the SQL as version-controlled models (for example dbt).
+
+**Cost:**
+
+- **Today:** ₹0. Everything is open source on a laptop.
+- **In production,** both options need an always-on scheduler and a warehouse.
+- **ELT also stores raw history.** That costs a little more in storage, but storage is the cheapest part, and it is what buys auditability and replay.
+
+**Top 3 risks of the recommended design, and how to handle them:**
+
+1. **The raw layer holds unmasked personal data, kept for a long time.** Restrict raw and quarantine to data engineers, encrypt them, purge customer PII on a retention schedule (DPDP Act), and log access.
+2. **Warnings don't stop a bad report from being published.** In the experiments, a 98% drop in orders and month-old data were both detected, but the report still went out. Make volume and freshness failures block the marts (keeping yesterday's tables live) and alert someone. Add a statistical price check: a ×100 price error was caught only by luck.
+3. **One laptop runs everything.** If it's off at 9 AM there is no report and no alert, and DuckDB is single-writer. Move to always-on hosting and alert on a *missing* 09:00 run, not just a failed one.
 
 ## 13. Screenshots
 
-_Milestone 5._
+No unmasked email or phone appears in any screenshot. The quarantine example is the orders file, which holds order fields and `customer_id` only.
+
+**ETL Graph view, green run**
+
+![ETL graph](screenshots/01_etl_graph_green_run.png)
+
+**ELT Graph view, green run**
+
+![ELT graph](screenshots/02_elt_graph_green_run.png)
+
+**Schedule `0 9 * * 1-6`, next run 2026-10-22 09:00 (UI timezone +05:30, IST)**
+
+![Schedule IST](screenshots/03_schedule_9am_ist_list.png)
+
+**Same DAGs with the UI timezone set to UTC: next run 03:30**
+
+![Schedule UTC](screenshots/04_schedule_utc_view.png)
+
+**One quarantine file (orders, with `failure_reason`)**
+
+![Quarantine file](screenshots/05_quarantine_file.png)
+
+**`dq_results`: every check of the latest ETL and ELT run**
+
+![dq_results](screenshots/06_dq_results.png)
+
+**`pipeline_runs`: run audit, including the FAILED experiment runs**
+
+![pipeline_runs](screenshots/07_pipeline_runs.png)
+
+**Payment reconciliation: ETL and ELT by reason, with sample rows**
+
+![Reconciliation](screenshots/08_payment_reconciliation.png)
+
+## 14. Known limitations
+
+- **No alerting.** Failures and warnings are visible in the UI and the audit tables, but nobody is notified. The assignment lists alerts as optional bonus work, so none was built; see Part G, risk 2.
+- **Warnings don't block publication.** Volume and freshness are Warning checks, as the assignment suggests. Experiments 7 and 9 showed the report is still replaced.
+- **Rules are written twice** (pandas and SQL). They are kept identical by sharing `config.py` and by the row-by-row parity check; a future change must touch both.
+- **Each run reprocesses the full files** (decision D11). That is right for daily exports of this size, but it won't scale 1000× (Part G).
+- **DuckDB is single-writer.** The two DAGs take turns through the one-slot pool. Querying the warehouse while a run is in progress blocks the run.
+- **The client questions in Part 0 are unanswered,** so the pipeline uses the documented defaults: S07's zone is `Unknown`, zero/negative quantities are rejected, and returns restate September revenue.
