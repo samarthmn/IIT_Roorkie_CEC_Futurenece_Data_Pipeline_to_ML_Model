@@ -226,7 +226,60 @@ The payment feed's last day is the latest `payment_ts` among payments for valid 
 
 ## 6. Part B: ELT pipeline
 
-_Milestone 3._
+DAG: `dags/nammamart_elt_samarth.py` (`nammamart_elt_samarth`). SQL: `include/sql/1*_raw`, `2*_stg`, `30_dq_results_elt.sql`, `4*_mart`. Python only checks the files, copies them into DuckDB and runs the `.sql` files (`include/nammamart/elt.py`); every transformation is SQL.
+
+### 6.1 Task graph (one task per layer)
+
+```text
+check_orders ───────┐
+check_payments ─────┤
+check_customers ────┤
+check_products ─────┼──► load_raw* ─► transform_staging* ─► transform_marts* ─► audit_run*
+check_stores ───────┤
+check_increments ───┘                                            * = pool duckdb_samarth
+     Extract              Load         └──── Transform (SQL, in the warehouse) ────┘
+```
+
+The six `check_*` tasks (file present, header as expected, row count) don't touch the warehouse, so they run in parallel. The warehouse tasks run one after another by design: DuckDB allows a single writer.
+
+### 6.2 Layers
+
+| Layer | Tables | How it is built |
+|---|---|---|
+| Raw | `raw_orders`, `raw_payments`, `raw_customers`, `raw_products`, `raw_stores` | `10_raw_create.sql` + `read_csv` with every column as `VARCHAR`, `auto_detect = false` and a null marker that never occurs, so blanks stay `''`, `N/A` stays `N/A`, `UPI ` keeps its space. Each row gets `_source_row` (1 = first data line), `_loaded_at`, `_source_file`, `_run_id`. The increment file goes into `raw_orders`, told apart by `_source_file`. After each load the row count must equal the file's data rows. |
+| Staging | `stg_stores`, `stg_products`, `stg_customers`, `stg_orders`, `stg_payments`, `stg_rejected_duplicates` | `20`–`27_*.sql`: cast types, standardise, keep one canonical row per key (extra copies → `stg_rejected_duplicates`), mask email and phone, apply every rule from section 7, set `dq_status` (PASS/WARN/FAIL), `failure_reason`, `warning_reason`. Original text of parsed columns is kept as `<column>_raw`. No staging table has `email`, `phone` or `full_name`. |
+| Mart | `mart_daily_store_kpis`, `mart_category_margin`, `mart_delivery_sla`, `mart_payment_reconciliation`, `mart_top_customers` | `40`–`44_mart_*.sql`, built only from staging rows with `dq_status` PASS or WARN. |
+
+Staging and marts read **only this run's raw batch** (`WHERE _run_id = <this run>`, decision D11). The raw layer keeps every batch: it is the audit log. A retry or Clear of the same run first deletes that run's own batch for the file, so it is never loaded twice; no other run's rows are ever deleted.
+
+### 6.3 Incremental load with MERGE
+
+`stg_orders` is built in three SQL steps:
+
+1. `24_stg_orders_build.sql`: canonical rows from this run's `orders.csv` batch, still as text.
+2. `25_stg_orders_merge_increment.sql`, once per increment file (oldest first): `MERGE INTO stg_orders ... ON t.order_id = s.order_id WHEN MATCHED THEN UPDATE ... WHEN NOT MATCHED THEN INSERT`. A correction overwrites the existing order; a new order is added. Before the MERGE the task logs how many increment orders are new vs existing.
+3. `26_stg_orders_apply_dq.sql`: types, standardises and validates the merged rows, so base and increment rows get exactly the same rules.
+
+Tested with the 1 October file: **150 inserted, 10 updated** (ORD000017, ORD000822, … now RETURNED), `COUNT(*) = COUNT(DISTINCT order_id)` in `stg_orders`.
+
+### 6.4 ETL ↔ ELT parity
+
+Both pipelines were run on the same input, then compared row by row (`EXCEPT` both ways), not just by totals.
+
+| Measure | ETL | ELT | Match |
+|---|---:|---:|---|
+| Orders passing (September files) | 2,308 | 2,308 | yes, same `order_id` set and same values |
+| Delivered orders | 2,086 | 2,086 | yes |
+| September net revenue | ₹11,34,962.80 | ₹11,34,962.80 | yes |
+| Gross margin | ₹2,60,826.90 | ₹2,60,826.90 | yes |
+| Rows set aside (quarantine / FAIL + duplicates) | 151 | 151 | yes, per file |
+| Reconciliation rows | 184 | 184 | yes, identical rows and reasons |
+| `dq_results` | 41 checks | 41 checks | identical counts and statuses |
+| Masked customers | 400 | 400 | identical masked email/phone/tier |
+| After the increment: orders passing | 2,458 | 2,458 | yes |
+| After the increment: net revenue (current-restated) | ₹12,10,421.30 | ₹12,10,421.30 | yes |
+
+They match because every rule is defined once (`config.py`) and mirrored exactly: strict timestamp format, values read as text in both, the same duplicate copy kept, the same reason codes, and decision D7 applied in both.
 
 ## 7. Part D: Data quality dimensions
 
@@ -299,7 +352,7 @@ _Milestone 5._
 
 `audit_run` is the last task of each DAG, with `trigger_rule="all_done"`, so it runs even after a failure. It records what happened in two tables, both with delete-then-insert on `(dag_id, run_id)` so a Clear or retry replaces the rows instead of duplicating them:
 
-- `dq_results`: every check from the validate step plus the volume check. Writing it here means the scorecard is saved even when transform or load fails.
+- `dq_results`: in the ETL, `audit_run` writes every check from the validate step plus the volume check, so the scorecard is saved even when transform or load fails. In the ELT the checks are SQL, so `transform_staging` writes them (`30_dq_results_elt.sql`).
 - `pipeline_runs`: one row per run, defined below.
 
 | Column | ETL | ELT |
