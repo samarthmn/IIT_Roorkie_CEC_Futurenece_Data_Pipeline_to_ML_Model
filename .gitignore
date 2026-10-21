@@ -23,3 +23,9 @@ include/reports/*.json
 !*.example
 *.py[cod]
 /tmp/
+.env.*
+!.env.example
+include/tmp/
+include/data/nammamart_experiments/
+include/reports/*.md
+include/reports/*.txt
