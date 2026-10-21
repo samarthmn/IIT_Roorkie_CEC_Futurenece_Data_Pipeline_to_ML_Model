@@ -24,13 +24,15 @@ Headline results on the September files:
 astro dev start
 # one-slot pool: only one task at a time may write to warehouse_samarth.duckdb (across both DAGs)
 astro dev run pools set duckdb_samarth 1 "Serialize writes to warehouse_samarth.duckdb"
-# profiler (Part 0): open a shell in the scheduler container, then run it there
+# profiler (Part 0), all six files: put the increment where the container can read it
+# (assignment/ is not mounted; include/tmp/ is gitignored), then run it in the scheduler container
+mkdir -p include/tmp && cp assignment/nammamart_dataset/orders_2026-10-01_increment.csv include/tmp/
 astro dev bash --scheduler
-python include/nammamart/profiling.py include/data/nammamart > include/reports/profile_report.md
+python include/nammamart/profiling.py include/data/nammamart include/tmp/orders_2026-10-01_increment.csv > include/reports/profile_report.md
 exit
 ```
 
-The committed `include/reports/profile_report.md` was produced this way, with the 1 October increment passed as an extra file argument. The profiler never prints names, emails or phone numbers: only counts and the affected keys.
+The committed `include/reports/profile_report.md` was produced with exactly these commands. The profiler never prints names, emails or phone numbers: only counts and the affected keys.
 
 Trigger a DAG (UI: **Trigger → with config**, or CLI):
 
@@ -984,7 +986,9 @@ How it is handled:
 - **Clear values exist only** in: `include/data/` (source files); `raw_customers` in the warehouse; the customers quarantine file; and the ETL's intermediate files under `include/tmp/samarth/<run>/`, which hold raw rows while a run is in progress (deleted when the run succeeds, kept after a failure so a Clear can resume). Everything except the source files is gitignored.
 - **Not printed anywhere:** task logs show counts and keys only, and the Part 0 profiler reports invalid emails and phones by `customer_id` and pattern (e.g. "missing @", "9 digits"), never by value.
 
-**Why mask rather than delete:** analysts still need to tell customers apart (top-customer ranking, duplicate detection, support look-ups by partial email), and finance needs to answer "whose order was this?" without seeing the full contact details. Masking keeps that usefulness while removing the ability to contact or identify the person from the report (data minimisation).
+**Why mask rather than delete:** analysts still need to tell customers apart (top-customer ranking, duplicate detection, support look-ups by partial email), and finance needs to answer "whose order was this?" without seeing the full contact details. Masking keeps that usefulness while **reducing exposure**: a report reader can no longer contact the customer or read their full email and phone.
+
+Masking does **not** make the data anonymous. `customer_id`, the partial email and phone, area, loyalty tier and purchase history can still be linked together, and back to the CRM, to single out a person. The reporting tables are therefore pseudonymised personal data, still covered by the DPDP Act, and still need access control (question 5) and retention limits (question 6). Real anonymisation, for example aggregating to zone or tier level or removing `customer_id`, would break the top-customer report the client asked for.
 
 **Law:** the **Digital Personal Data Protection Act, 2023 (DPDP Act)**, with the **DPDP Rules, 2025**, notified in November 2025 with a phased start (most obligations apply after a transition period; confirm the current effective dates with legal before relying on them). It expects:
 
@@ -1013,7 +1017,7 @@ Unmasked `customers.phone` in raw: ideally **nobody** reads it from the warehous
 | Raw orders and payments | ~8 years: they are financial records (the Companies Act, 2013 requires books of account for 8 years) | Archive to cold storage, then delete |
 | Quarantine files | ~90 days after the issue is resolved | Delete |
 | Raw customer PII (`raw_customers`, source CRM extracts) | While the customer account is active + a short grace period | Erase or anonymise (DPDP: erase when the purpose is served) |
-| Masked analytical tables | Longer (multi-year trends), as long as they can't re-identify anyone | Re-check that masking still holds before extending |
+| Masked reporting tables (still pseudonymous: they carry `customer_id`) | As long as the business uses them, under the same access controls; customer rows follow the CRM erasure schedule | For multi-year trends keep only aggregates without `customer_id` (zone, store, category, tier), which no longer identify anyone |
 | `dq_results`, `pipeline_runs` | 1–2 years (trend and audit history) | Delete |
 
 ### 7. Secrets
