@@ -30,3 +30,8 @@ include/data/nammamart_experiments/
 include/reports/*.md
 include/reports/*.txt
 !include/reports/profile_report.md
+
+# Curated quarantine evidence (orders/products only: no personal data)
+!include/quarantine/samarth/orders_failed_manual__2026-10-22T02_12_18.094392_00_00.csv
+!include/quarantine/samarth/products_failed_manual__2026-10-22T02_12_18.094392_00_00.csv
+!include/quarantine/samarth/orders_failed_manual__2026-10-21T13_49_54.575784_00_00.csv

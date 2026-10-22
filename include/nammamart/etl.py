@@ -24,6 +24,14 @@ def _text(s: pd.Series) -> pd.Series:
     return s.where(s.ne(""), None)
 
 
+def _blank_failed(values: pd.Series, failure_reason: pd.Series, codes) -> pd.Series:
+    """Decision D7: a master row that failed stays in its dimension (its orders must still join),
+    but the value that failed is not published: it becomes NULL. Raw and quarantine keep the original."""
+    pattern = r"(?:^|;)(?:" + "|".join(codes) + r")(?:;|$)"
+    failed = failure_reason.fillna("").str.contains(pattern)
+    return values.mask(failed)
+
+
 def build_dim_store(stores: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({
         "store_id": stores["store_id"].str.strip(),
@@ -44,8 +52,9 @@ def build_dim_product(products: pd.DataFrame) -> pd.DataFrame:
         "category": _text(products["category"]).fillna("Unknown"),
         "sub_category": _text(products["sub_category"]),
         "brand": _text(products["brand"]),
-        "mrp": to_num(products["mrp"]),
-        "cost_price": to_num(products["cost_price"]),
+        "mrp": _blank_failed(to_num(products["mrp"]), products["failure_reason"], ["nonpositive_mrp"]),
+        "cost_price": _blank_failed(to_num(products["cost_price"]), products["failure_reason"],
+                                    config.UNTRUSTED_COST_REASONS),
         "unit": _text(products["unit"]),
         "is_perishable": products["is_perishable"].str.strip().str.lower().eq("true"),
         "launch_date": to_ts(products["launch_date"], config.DATE_FORMAT).dt.date,
@@ -62,7 +71,8 @@ def build_dim_customer(customers: pd.DataFrame) -> pd.DataFrame:
         "city": _text(customers["city"]),
         "area": _text(customers["area"]),
         "loyalty_tier": std_loyalty_tier(customers["loyalty_tier"]),
-        "signup_date": to_ts(customers["signup_date"], config.DATE_FORMAT).dt.date,
+        "signup_date": _blank_failed(to_ts(customers["signup_date"], config.DATE_FORMAT), customers["failure_reason"],
+                                     ["future_signup_date"]).dt.date,
         "is_active": customers["is_active"].str.strip().str.upper().eq("Y"),
         **{c: customers[c] for c in DQ_COLUMNS},
     })

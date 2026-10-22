@@ -1,7 +1,8 @@
 -- STAGING: products. One row per product_id (first copy in file order: orders are priced at the
 -- first copy's mrp for P0030 and P0140).
 -- Critical rules: products_category_present, products_mrp_positive, products_cost_positive, products_cost_le_mrp.
--- A product that fails stays in stg_products with dq_status = 'FAIL' so its orders still join (decision D7).
+-- A product that fails stays in stg_products with dq_status = 'FAIL' so its orders still join (decision D7),
+-- but the value that failed is published as NULL (a negative mrp, an untrusted cost); raw keeps the original.
 
 INSERT INTO stg_rejected_duplicates
 SELECT _source_file, product_id, _source_row, 'duplicate_product_id', _run_id
@@ -35,8 +36,10 @@ SELECT
     COALESCE(NULLIF(TRIM(category), ''), 'Unknown')             AS category,
     NULLIF(TRIM(sub_category), '')                              AS sub_category,
     NULLIF(TRIM(brand), '')                                     AS brand,
-    CAST(mrp_num AS DECIMAL(12,2))                              AS mrp,
-    CAST(cost_num AS DECIMAL(12,2))                             AS cost_price,
+    CASE WHEN NOT regexp_matches(COALESCE(fr, ''), '(^|;)nonpositive_mrp(;|$)')
+         THEN CAST(mrp_num AS DECIMAL(12,2)) END                AS mrp,
+    CASE WHEN NOT regexp_matches(COALESCE(fr, ''), '(^|;)(nonpositive_mrp|nonpositive_cost_price|cost_above_mrp)(;|$)')
+         THEN CAST(cost_num AS DECIMAL(12,2)) END               AS cost_price,
     NULLIF(TRIM(unit), '')                                      AS unit,
     LOWER(TRIM(is_perishable)) = 'true'                         AS is_perishable,
     CAST(TRY_STRPTIME(TRIM(launch_date), '%Y-%m-%d') AS DATE)   AS launch_date,

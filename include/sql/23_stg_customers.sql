@@ -52,7 +52,7 @@ SELECT
     NULLIF(TRIM(city), '')                                      AS city,
     NULLIF(TRIM(area), '')                                      AS area,
     tier_std                                                    AS loyalty_tier,
-    CAST(signup_ts AS DATE)                                     AS signup_date,
+    CASE WHEN fr IS NULL THEN CAST(signup_ts AS DATE) END       AS signup_date,   -- a future date is not published
     UPPER(TRIM(is_active)) = 'Y'                                AS is_active,
     CASE WHEN fr IS NOT NULL THEN 'FAIL' WHEN wr IS NOT NULL THEN 'WARN' ELSE 'PASS' END AS dq_status,
     fr                                                          AS failure_reason,
